@@ -67,14 +67,6 @@ private:
 	uint _sceneWidth;
 	uint _sceneHeight;
 
-	// The game's own video mode, as last requested through loadVideoMode.
-	// The VR path renders it at the origin of the PBuffer backbuffer, and
-	// the coop capture path (§6) reads that region; zero means no game has
-	// asked for a mode yet (the launcher is on screen), and capture stays
-	// off honestly rather than reading undefined pixels.
-	uint _coopGameWidth;
-	uint _coopGameHeight;
-
 	GLuint _vrQuadProgram;
 	GLuint _vrQuadVBO;
 	GLint _vrUniformMVP;

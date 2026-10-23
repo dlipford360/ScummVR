@@ -192,16 +192,23 @@ public:
 
 	void reset();
 
+	// The bound on fragments per frame, and the number a sender's own
+	// pre-check must use. The wire itself allows any uint16 count; this
+	// limits the received bitmask and the per-frame buffer. 256 fragments
+	// = 275 KB frames: the largest measured real-game keyframe was 144 KB
+	// (135 fragments), and the former 64 cap dropped 98 of 100 real
+	// keyframes whole (2026-10-23, guide §14).
+	static const uint16 kMaxFragments = 256;
+
 private:
 	static const int kSlots = 4;
-	static const uint16 kMaxFragments = 64; // bounds the received bitmask
 
 	struct Slot {
 		bool inUse;
 		bool poisoned;
 		uint32 frameId;
 		uint16 count;
-		uint64 received; // one bit per index
+		uint64 received[kMaxFragments / 64]; // one bit per index
 		byte *buffer;
 		int capacity;
 		int lastLen; // payload length of the final fragment, which fixes the total

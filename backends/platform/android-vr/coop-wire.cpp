@@ -473,7 +473,7 @@ FrameReassembler::FrameReassembler() {
 		_slots[i].poisoned = false;
 		_slots[i].frameId = 0;
 		_slots[i].count = 0;
-		_slots[i].received = 0;
+		memset(_slots[i].received, 0, sizeof(_slots[i].received));
 		_slots[i].buffer = nullptr;
 		_slots[i].capacity = 0;
 		_slots[i].lastLen = 0;
@@ -491,7 +491,7 @@ void FrameReassembler::reset() {
 		_slots[i].inUse = false;
 		_slots[i].poisoned = false;
 		_slots[i].count = 0;
-		_slots[i].received = 0;
+		memset(_slots[i].received, 0, sizeof(_slots[i].received));
 		_slots[i].lastLen = 0;
 		_slots[i].dataLen = 0;
 	}
@@ -520,7 +520,7 @@ FrameReassembler::Slot *FrameReassembler::slotFor(uint32 frameId) {
 	reuse->poisoned = false;
 	reuse->frameId = frameId;
 	reuse->count = 0;
-	reuse->received = 0;
+	memset(reuse->received, 0, sizeof(reuse->received));
 	reuse->lastLen = 0;
 	reuse->dataLen = 0;
 	return reuse;
@@ -588,11 +588,20 @@ bool FrameReassembler::feed(uint32 frameId, uint16 index, uint16 count, const by
 		return false;
 	}
 	memcpy(slot->buffer + offset, data, dataLen);
-	slot->received |= (uint64)1 << index;
+	slot->received[index >> 6] |= (uint64)1 << (index & 63);
 
 	// Complete only when every index arrived.
-	const uint64 expected = (count >= 64) ? ~(uint64)0 : (((uint64)1 << count) - 1);
-	if (slot->received != expected)
+	bool complete = true;
+	for (int w = 0; w < kMaxFragments / 64; ++w) {
+		const int bits = (int)count - w * 64;
+		const uint64 expected = (bits >= 64) ? ~(uint64)0
+			: (bits <= 0 ? 0 : (((uint64)1 << bits) - 1));
+		if (slot->received[w] != expected) {
+			complete = false;
+			break;
+		}
+	}
+	if (!complete)
 		return false;
 
 	// The uniform-chunk rule is what makes the size computable here: every
@@ -602,7 +611,7 @@ bool FrameReassembler::feed(uint32 frameId, uint16 index, uint16 count, const by
 	slot->dataLen = total;
 	slot->inUse = false;
 	slot->poisoned = false;
-	slot->received = 0;
+	memset(slot->received, 0, sizeof(slot->received));
 	slot->count = 0;
 	slot->lastLen = 0;
 

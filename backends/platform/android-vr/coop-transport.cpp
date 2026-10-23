@@ -344,8 +344,8 @@ bool Transport::sendMedia(char type, uint32 frameId, const byte *data, int dataL
 		return false;
 
 	const int count = Wire::fragmentCount(dataLen);
-	// The reassembler on the other end tracks at most 64 fragments per frame.
-	if (count < 1 || count > 64)
+	// The reassembler on the other end tracks at most kMaxFragments per frame.
+	if (count < 1 || count > Wire::FrameReassembler::kMaxFragments)
 		return false;
 
 	for (int index = 0; index < count; ++index) {

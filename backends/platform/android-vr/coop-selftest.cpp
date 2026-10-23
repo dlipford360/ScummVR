@@ -67,7 +67,11 @@ const char *const kDefaultMarkerPaths[] = {
 	"/sdcard/scummvm-coop-test.txt",
 };
 
-const int kMaxRunSeconds = 60;
+// Upper bound on the marker's seconds key. A two-headset visual check needs
+// the host's video window wide open while the guest starts (a 60 s cap made
+// a late-joining guest race an already-finished host, 2026-10-23); 5 minutes
+// is comfortable and still bounded.
+const int kMaxRunSeconds = 300;
 
 struct Config {
 	char baseUrl[160];
@@ -265,17 +269,18 @@ struct VideoRun {
 	std::vector<byte> baseY;    // the static scene, computed once
 	std::vector<byte> frame;    // exactly the bytes the codec accepts
 	std::vector<byte> rgba;     // capture mode: the newest readback, pre-conversion
+	bool haveLastFrame;         // capture mode: frame holds the last real pixels
 	std::vector<int64> submitAt; // frame index -> monotonic us at hand-off
 	std::vector<int64> latUs;    // completed AUs: submit -> callback latency
 	std::vector<int> keyAt;      // frame indices whose output was a key AU
 
 	int aus, keys, maxAu, sendFails, oversized;
-	int captured, missedCapture; // capture mode: real frames used, ticks without one
+	int captured, missedCapture, refed; // capture mode: real frames used, ticks without one, duplicates re-fed
 	uint64 auBytes;
 
-	VideoRun() : sendRoom(false), transport(nullptr), vFrameId(1),
+	VideoRun() : sendRoom(false), transport(nullptr), vFrameId(1), haveLastFrame(false),
 		aus(0), keys(0), maxAu(0), sendFails(0), oversized(0),
-		captured(0), missedCapture(0), auBytes(0) {}
+		captured(0), missedCapture(0), refed(0), auBytes(0) {}
 };
 
 int64 nowUs() {
@@ -371,6 +376,51 @@ void renderVideoFrame(VideoRun *r, int frameIndex) {
 // picture. Chroma comes from the 2x2 mean rather than the top-left pixel,
 // and the row flip costs one subtraction - which is why the capture unit
 // leaves orientation here instead of spending a blit or a copy on it.
+// One-shot frame dumps for bring-up: the first real captured frame and one
+// ~10 s later go to BMP files in the app's files dir, so the exact pixels
+// the capture produced can be pulled off the device and looked at. This is
+// how a wrong-color or wrong-region report gets settled with evidence
+// instead of argument. The path is the debug package's files dir - the
+// same one scummvm.log lives in.
+void dumpCaptureProbe(const byte *rgba, int n) {
+	char path[160];
+	snprintf(path, sizeof(path),
+		"/data/data/org.scummvm.scummvm.vr.debug/files/coop-frame-%d.bmp", n);
+	FILE *f = fopen(path, "wb");
+	if (!f) {
+		warning("coop selftest: cannot write the capture probe %s", path);
+		return;
+	}
+	const int w = kVideoWidth, h = kVideoHeight, dim3 = w * h * 3;
+	byte head[14] = {'B', 'M'};
+	uint32 fileSize = 14 + 40 + dim3;
+	head[2] = fileSize; head[3] = fileSize >> 8; head[4] = fileSize >> 16; head[5] = fileSize >> 24;
+	head[10] = 54; // pixel data offset
+	fwrite(head, 1, 14, f);
+	byte ih[40] = {0};
+	ih[0] = 40;
+	ih[4] = w; ih[5] = w >> 8; ih[6] = w >> 16; ih[7] = w >> 24;
+	// Negative height: top-down rows, which is what the walk below writes.
+	ih[8] = -h & 0xFF; ih[9] = (-h) >> 8; ih[10] = (-h) >> 16; ih[11] = (-h) >> 24;
+	ih[12] = 1; ih[14] = 24; // planes, bits per pixel
+	ih[20] = dim3 & 0xFF; ih[21] = dim3 >> 8; ih[22] = dim3 >> 16; ih[23] = dim3 >> 24;
+	fwrite(ih, 1, 40, f);
+	// The mailbox keeps the GL bottom-first orientation; a top-down BMP
+	// starts from the last row.
+	for (int y = h - 1; y >= 0; --y) {
+		const byte *row = rgba + (size_t)y * w * 4;
+		byte rgb[w * 3];
+		for (int x = 0; x < w; ++x) {
+			rgb[x * 3] = row[x * 4 + 2];
+			rgb[x * 3 + 1] = row[x * 4 + 1];
+			rgb[x * 3 + 2] = row[x * 4];
+		}
+		fwrite(rgb, 1, w * 3, f);
+	}
+	fclose(f);
+	debug("coop selftest: capture probe written to %s", path);
+}
+
 void rgbaToNv12(const byte *src, byte *dst) {
 	const int w = kVideoWidth, h = kVideoHeight;
 	byte *Y = dst;
@@ -388,8 +438,13 @@ void rgbaToNv12(const byte *src, byte *dst) {
 			const int r = (s[col * 4] + s[col * 4 + 4] + s2[col * 4] + s2[col * 4 + 4]) >> 2;
 			const int g = (s[col * 4 + 1] + s[col * 4 + 5] + s2[col * 4 + 1] + s2[col * 4 + 5]) >> 2;
 			const int b = (s[col * 4 + 2] + s[col * 4 + 6] + s2[col * 4 + 2] + s2[col * 4 + 6]) >> 2;
-			uv[col] = (byte)(((-38 * r - 74 * g + 112 * b + 512) >> 10) + 128);
-			uv[col + 1] = (byte)(((112 * r - 94 * g - 18 * b + 512) >> 10) + 128);
+			// BT.601 limited-range chroma. The shift must match the Y
+			// line's (>>8): these coefficients sum to zero and peak at
+			// ~28560, so >>8 lands U/V in the correct 16..240 swing.
+			// A >>10 here quietly shrinks chroma to a quarter and the
+			// guest sees grayscale with green flicker (measured, 2026-10-23).
+			uv[col] = (byte)(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
+			uv[col + 1] = (byte)(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
 		}
 	}
 }
@@ -413,11 +468,12 @@ void videoAu(void *ctx, const byte *au, int len, uint32 flags, int64 ptsUs) {
 	}
 
 	if (r->sendRoom && r->transport) {
-		// The reassembler on the other end caps a frame at 64 fragments. At
-		// this size and bitrate the encoder should never reach it, but if a
-		// driver overshoots, the right answer is to drop the whole frame - a
-		// partial frame poisons the decoder - and to count it.
-		const int kMaxFrameBytes = 64 * Wire::kMaxFragmentBytes;
+		// The reassembler on the other end caps a frame at kMaxFragments.
+		// A real game's keyframes reach it (144 KB measured), so the bound
+		// is not theoretical - but if a driver overshoots even that, the
+		// right answer is to drop the whole frame - a partial frame poisons
+		// the decoder - and to count it.
+		const int kMaxFrameBytes = Wire::FrameReassembler::kMaxFragments * Wire::kMaxFragmentBytes;
 		if (len > kMaxFrameBytes) {
 			++r->oversized;
 			return;
@@ -865,20 +921,37 @@ void runTestBody(const Config &cfg) {
 			if (videoFramesFed >= (int)video.submitAt.size()) {
 				videoOn = false;
 			} else if (cfg.capture) {
-				// Capture mode: real pixels or a skipped tick, never a quiet
-				// fallback to the synthetic scene - a measurement that
-				// changes content when capture fails is not measuring what
-				// it says. A skipped tick costs the encoder nothing (no
-				// frame goes in, pts stays monotonic for the frames that do).
+				// Capture mode: the newest real pixels if there are any, otherwise
+				// the last ones again. The re-feed is the design, not padding: a
+				// game repaints on its own schedule (~10-12 fps for SCUMM titles),
+				// and feeding the 1-frame encoder pipeline at the *game's* rate puts
+				// the wait for the next input into every frame's measured latency
+				// (p50 201 ms, §14). Feeding at the encode cadence with a duplicate
+				// costs a zero-residual P-frame - a few hundred bytes - and keeps
+				// the pipeline's 35 ms pacing regardless of who is idle. No
+				// synthetic fallback: if capture never produced a frame, nothing is
+				// sent, and the report says so.
 				int64 capAt = 0;
-				if (!Coop::grabCapturedFrame(video.rgba.data(), &capAt)) {
-					++video.missedCapture;
-					if (video.missedCapture == 1)
-						warning("coop selftest: the capture path has produced no frame yet - "
-							"is a game running? (the marker's game= key autolaunches one)");
-				} else {
+				if (Coop::grabCapturedFrame(video.rgba.data(), &capAt)) {
+					// Probe: the first real frame, and one ~10 s later. Two
+					// samples distinguish a static wrong (bad region, bad
+					// palette) from a dynamic one (fades, flicker).
+					if (video.captured == 0)
+						dumpCaptureProbe(video.rgba.data(), 1);
+					else if (video.captured == 300)
+						dumpCaptureProbe(video.rgba.data(), 2);
 					rgbaToNv12(video.rgba.data(), video.frame.data());
 					++video.captured;
+					video.haveLastFrame = true;
+				} else {
+					++video.missedCapture;
+					if (video.missedCapture == 1 && !video.haveLastFrame)
+						warning("coop selftest: the capture path has produced no frame yet - "
+							"is a game running? (the marker's game= key autolaunches one)");
+				}
+				if (video.haveLastFrame) {
+					if (capAt == 0)
+						++video.refed;
 					video.submitAt[videoFramesFed] = nowUs();
 					if (!video.enc.submitFrame(video.frame.data(),
 							(int64)videoFramesFed * 1000000 / kVideoFps, videoAu, &video)) {
@@ -929,8 +1002,10 @@ void runTestBody(const Config &cfg) {
 			Coop::g_coopCaptureWant = false;
 			const Coop::CaptureStats cs = Coop::captureStats();
 			debug("coop selftest: host capture: %d readbacks issued, %d collected, %d not-ready, "
-					"%d map failures; encoder fed %d captured frames, %d ticks had no new frame",
-				cs.issues, cs.reaps, cs.missed, cs.mapFails, video.captured, video.missedCapture);
+					"%d map failures; encoder fed %d frames (%d real, %d duplicate re-feeds), "
+					"%d ticks had no captured frame to re-feed yet",
+				cs.issues, cs.reaps, cs.missed, cs.mapFails,
+				video.captured + video.refed, video.captured, video.refed, video.missedCapture);
 		}
 	}
 	if (cfg.videoMode == 3 && decode.dec.isOpen()) {

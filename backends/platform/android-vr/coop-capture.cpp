@@ -120,7 +120,7 @@ bool ensureGl() {
 
 } // anonymous namespace
 
-void captureVideoFrame(int gameW, int gameH, int sceneW, int sceneH) {
+void captureVideoFrame(int sceneW, int sceneH) {
 	if (!ensureGl())
 		return;
 
@@ -167,15 +167,15 @@ void captureVideoFrame(int gameW, int gameH, int sceneW, int sceneH) {
 		}
 	}
 
-	// 2. Issue this frame. Clamp the game region to the framebuffer first:
-	// a video mode the manager never got around to honouring must not turn
-	// into an out-of-range blit.
-	if (gameW <= 0 || gameH <= 0 || sceneW <= 0 || sceneH <= 0)
+	// 2. Issue this frame: the whole backbuffer. No assumption about where
+	// inside it the game sits - the base manager composites the game (its
+	// own scaling and letterboxing) into this buffer, and the host's own
+	// view reads the same pixels, so what is captured is what the host
+	// player sees. Proven by BMP probe dumps on the device (2026-10-23):
+	// an origin-region assumption put the game off-center with black
+	// around it, which the guest could only render as black plus a strip.
+	if (sceneW <= 0 || sceneH <= 0)
 		return;
-	if (gameW > sceneW)
-		gameW = sceneW;
-	if (gameH > sceneH)
-		gameH = sceneH;
 
 	// The scissor state belongs to whoever rendered last; blits honor it on
 	// the draw side, and a stale GUI scissor would clip the capture. Save
@@ -184,24 +184,37 @@ void captureVideoFrame(int gameW, int gameH, int sceneW, int sceneH) {
 	if (scissorOn)
 		glDisable(GL_SCISSOR_TEST);
 
-	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-	glReadBuffer(GL_BACK);
-	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_capFbo);
-	// No Y flip here on purpose: the capture keeps the framebuffer's own
-	// orientation (row 0 = bottom), and the consumer flips rows while it
-	// converts - flipping in a walk costs nothing, flipping here would cost
-	// a second blit or a buffer copy.
-	glBlitFramebuffer(0, 0, gameW, gameH, 0, 0, kCapWidth, kCapHeight,
-		GL_COLOR_BUFFER_BIT, GL_NEAREST);
-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	if (scissorOn)
-		glEnable(GL_SCISSOR_TEST);
-
 	glBindBuffer(GL_PIXEL_PACK_BUFFER, g_capPbo[g_capSlot]);
+	if (sceneW == kCapWidth && sceneH == kCapHeight) {
+		// A backbuffer exactly the encode target: read it directly.
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+		glReadBuffer(GL_BACK);
+	} else {
+		// The usual case on this backend - the PBuffer is 1920x1080 -
+		// scale down through the capture FBO. No Y flip either way on
+		// purpose: the capture keeps the framebuffer's own orientation
+		// (row 0 = bottom), and the consumer flips rows while it converts;
+		// flipping in a walk costs nothing, flipping here would cost a
+		// second blit or a buffer copy.
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+		glReadBuffer(GL_BACK);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_capFbo);
+		// GL_LINEAR, not NEAREST: this path is a downscale, and nearest
+		// sampling of upscaled pixel art aliases hard - the last run's
+		// IDRs measured 144 KB (twice the frame budget, 38 dropped) from
+		// exactly that shimmer. A filtered downscale costs a touch of
+		// softness and buys back stable bitrate.
+		glBlitFramebuffer(0, 0, sceneW, sceneH, 0, 0, kCapWidth, kCapHeight,
+			GL_COLOR_BUFFER_BIT, GL_LINEAR);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, g_capFbo);
+	}
 	// With a pack buffer bound the pointer is an offset into it, and the
 	// readback itself is asynchronous - the fence below is its completion.
 	glReadPixels(0, 0, kCapWidth, kCapHeight, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+	if (scissorOn)
+		glEnable(GL_SCISSOR_TEST);
 	g_capFence[g_capSlot] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 	glFlush();
 	++g_capIssues;

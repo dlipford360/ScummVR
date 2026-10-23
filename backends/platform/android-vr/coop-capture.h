@@ -33,12 +33,17 @@
 // counted (in practice the driver finishes long before, and refreshScreen
 // already ends in a glFinish).
 //
-// The readback goes through a fixed 640x480 capture FBO - the M1 encode
-// target - because one GL blit does any scaling the game's video mode needs
-// and a CPU downscale would not. For a 640x480 game (classic SCUMM, the DOTT
-// reference) the blit is a 1:1 copy. Bytes cross to the sending thread
-// through the same single-slot mailbox shape the guest render path uses; the
-// consumer converts RGBA to the codec's NV12 on its own thread.
+// The readback is the whole backbuffer, which is exactly what the host's own
+// virtual screen shows - the base OpenGL manager composites the game into it
+// (scaled and letterboxed by its own draw-rect logic), and a first run's
+// guess that the game "occupies the origin region" was measured wrong: probe
+// dumps showed the game at an unexpected offset with black around it (BMP
+// probes, 2026-10-23). Capturing the buffer itself removes every assumption
+// about where the game sits. The fixed 640x480 capture FBO is used only if
+// the backbuffer is ever a different size than the encode target - one GL
+// blit does that scaling, a CPU downscale would not. Bytes cross to the
+// sending thread through the same single-slot mailbox shape the guest render
+// path uses; the consumer converts RGBA to the codec's NV12 on its own thread.
 
 #ifndef BACKENDS_PLATFORM_ANDROID_VR_COOP_CAPTURE_H
 #define BACKENDS_PLATFORM_ANDROID_VR_COOP_CAPTURE_H
@@ -56,11 +61,12 @@ enum { kCapBytes = kCapWidth * kCapHeight * 4 }; // RGBA8
 extern volatile bool g_coopCaptureWant;
 
 // Graphics-thread side. Call once per rendered frame: reaps the previous
-// readback into the mailbox, then issues this frame's. gameW/gameH is the
-// game's own video region (drawn at the origin of the default framebuffer),
-// sceneW/sceneH its full size; the blit source is clamped to the framebuffer
-// so a mis-declared video mode cannot read outside it.
-void captureVideoFrame(int gameW, int gameH, int sceneW, int sceneH);
+// readback into the mailbox, then issues this frame's. sceneW/sceneH is the
+// default framebuffer's full size - the capture is that whole buffer, since
+// the compositor has already placed the game inside it. If the buffer is
+// larger than the encode target the capture FBO's blit scales it; otherwise
+// the readback goes straight off the backbuffer.
+void captureVideoFrame(int sceneW, int sceneH);
 
 // Consumer side (the sending thread). Copies the newest frame not yet taken
 // into dst, which must hold exactly kCapBytes. Row 0 is the BOTTOM of the
