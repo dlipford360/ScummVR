@@ -48,7 +48,20 @@ namespace Coop {
 //   invite  = <invite secret>             guest only
 //   seconds = 20                          how long to stay joined (capped)
 //   plaintext = 1                         opt in to an unsealed dev room
+//   video   = bench | send | recv         encoder bench / host send / guest recv
+//   display = true                        with video=recv: show decoded frames on
+//                                         the screen quad (render hand-off)
+//   capture = true                        with video=send: encode the live game
+//                                         framebuffer (the §6 capture path)
+//                                         instead of the synthetic scene
+//   game    = <target>                    start that ScummVM game directly, so a
+//                                         capture run has a real animated scene
 //
+// selfTestGameTarget() is what the platform layer calls to find out about the
+// game= key: it is only meaningful combined with the marker, and the answer is
+// ready by the time startSelfTestIfRequested() returns.
+const char *selfTestGameTarget();
+
 // A guest run is how a two-headset test is driven: one headset hosts, the log
 // prints the room code and invite, the other gets them typed into its marker
 // file. Secrets are never logged; lengths are.

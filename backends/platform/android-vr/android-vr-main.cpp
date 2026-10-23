@@ -1451,14 +1451,19 @@ static void *scummvmThreadFunc(void *arg) {
 	// Build args
 	std::string configOpt = std::string("--config=") + kScummVMFilesDir + "/scummvm.ini";
 	std::string themeOpt = std::string("--themepath=") + themesDirPath();
-	const char *argv[] = { "scummvm", configOpt.c_str(), themeOpt.c_str() };
-	int argc = 3;
 
+	// A selftest marker may name a game to start directly, so a capture run
+	// has a live animated scene without anyone reaching the launcher. The
+	// target is only ever non-empty when the marker asked for it.
 	// Coop bring-up probe: does nothing unless /sdcard/scummvm-coop-test.txt is
 	// present. See coop-selftest.h. It runs on its own thread and always finishes
 	// by itself - 5 s warmup, 15 s for the control plane, 10 s for HELLO, then at
 	// most 60 s joined.
 	Coop::startSelfTestIfRequested();
+	const char *coopGame = Coop::selfTestGameTarget();
+	const bool coopAutoGame = coopGame[0] != 0;
+	const char *argv[] = { "scummvm", configOpt.c_str(), themeOpt.c_str(), coopGame };
+	int argc = coopAutoGame ? 4 : 3;
 
 	int result = scummvm_main(argc, argv);
 	// ScummVM is tearing down its OSystem; stop pushing events immediately

@@ -36,6 +36,7 @@
 #include "backends/platform/android/jni-android.h"
 #include "backends/graphics/opengl/framebuffer.h"
 #include "backends/graphics/opengl/texture.h"
+#include "backends/platform/android-vr/coop-capture.h"
 
 #include "common/events.h"
 
@@ -106,6 +107,8 @@ AndroidVRGraphicsManager::AndroidVRGraphicsManager(OpenXRSession *xrSession)
 	  _sceneDepthBuffer(0),
 	  _sceneWidth(1920),
 	  _sceneHeight(1080),
+	  _coopGameWidth(0),
+	  _coopGameHeight(0),
 	  _vrQuadProgram(0),
 	  _vrQuadVBO(0),
 	  _vrUniformMVP(-1),
@@ -225,7 +228,15 @@ void AndroidVRGraphicsManager::updateScreen() {
 
 bool AndroidVRGraphicsManager::loadVideoMode(uint requestedWidth, uint requestedHeight,
                                               bool resizable, int antialiasing) {
-	// VR mode uses fixed scene resolution
+	// VR mode uses fixed scene resolution - but remember what the game asked
+	// for. That is the region of the PBuffer backbuffer its pixels occupy,
+	// and the coop capture path reads exactly that (§6). Without this the
+	// capture path would have to guess the game's size or rescale the whole
+	// 1920x1080 backbuffer.
+	if (requestedWidth && requestedHeight) {
+		_coopGameWidth = requestedWidth;
+		_coopGameHeight = requestedHeight;
+	}
 	return true;
 }
 
@@ -241,6 +252,16 @@ void AndroidVRGraphicsManager::refreshScreen() {
 			GL_COLOR_BUFFER_BIT, GL_NEAREST);
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 		glFinish(); // Ensure texture is ready before VR thread reads it
+
+		// §6 capture point: the game's pixels, from the same backbuffer we
+		// just blitted, into the coop capture path's PBOs. The flag is set
+		// only while something is asking for frames (the self-test's
+		// capture mode), and _coopGameWidth is zero until a game asked for
+		// a video mode - so a plain run pays nothing here, and a launcher
+		// screen is reported as no-source rather than captured as noise.
+		if (Coop::g_coopCaptureWant && _coopGameWidth && _coopGameHeight)
+			Coop::captureVideoFrame((int)_coopGameWidth, (int)_coopGameHeight,
+				(int)_sceneWidth, (int)_sceneHeight);
 	}
 }
 

@@ -25,6 +25,7 @@
 #define FORBIDDEN_SYMBOL_ALLOW_ALL
 
 #include "backends/platform/android-vr/coop-selftest.h"
+#include "backends/platform/android-vr/coop-capture.h"
 #include "backends/platform/android-vr/coop-video-display.h"
 
 #include "common/scummsys.h"
@@ -83,6 +84,13 @@ struct Config {
 	// With videoMode 3, also hand the decoded frames to the VR thread so the
 	// virtual screen quad shows the host's video (display = true).
 	bool display;
+	// With videoMode 2, take the encoder's input from the live game
+	// framebuffer (the §6 capture path) instead of the synthetic scene.
+	bool capture;
+	// A ScummVM game target to start directly (launcher skipped) so a
+	// capture run has a real animated scene without anyone putting on the
+	// headset. Empty = leave the launcher alone.
+	char gameTarget[64];
 };
 
 void trim(char *text) {
@@ -146,6 +154,10 @@ bool readConfig(const char *path, Config *out) {
 				warning("coop selftest: video value must be \"bench\", \"send\" or \"recv\", got \"%s\"", value);
 		} else if (!strcmp(key, "display")) {
 			out->display = !strcmp(value, "true") || atoi(value) != 0;
+		} else if (!strcmp(key, "capture")) {
+			out->capture = !strcmp(value, "true") || atoi(value) != 0;
+		} else if (!strcmp(key, "game")) {
+			snprintf(out->gameTarget, sizeof(out->gameTarget), "%s", value);
 		} else if (!strcmp(key, "seconds")) {
 			out->seconds = atoi(value);
 			if (out->seconds < 1)
@@ -252,15 +264,18 @@ struct VideoRun {
 
 	std::vector<byte> baseY;    // the static scene, computed once
 	std::vector<byte> frame;    // exactly the bytes the codec accepts
+	std::vector<byte> rgba;     // capture mode: the newest readback, pre-conversion
 	std::vector<int64> submitAt; // frame index -> monotonic us at hand-off
 	std::vector<int64> latUs;    // completed AUs: submit -> callback latency
 	std::vector<int> keyAt;      // frame indices whose output was a key AU
 
 	int aus, keys, maxAu, sendFails, oversized;
+	int captured, missedCapture; // capture mode: real frames used, ticks without one
 	uint64 auBytes;
 
 	VideoRun() : sendRoom(false), transport(nullptr), vFrameId(1),
-		aus(0), keys(0), maxAu(0), sendFails(0), oversized(0), auBytes(0) {}
+		aus(0), keys(0), maxAu(0), sendFails(0), oversized(0),
+		captured(0), missedCapture(0), auBytes(0) {}
 };
 
 int64 nowUs() {
@@ -344,6 +359,37 @@ void renderVideoFrame(VideoRun *r, int frameIndex) {
 		for (int row = by / 2; row < (by + bh) / 2; ++row) {
 			memset(u + (size_t)row * (w / 2) + bx / 2, 235, bw / 2);
 			memset(v + (size_t)row * (w / 2) + bx / 2, 45, bw / 2);
+		}
+	}
+}
+
+// The capture source's conversion: the capture unit's RGBA (row 0 = the
+// BOTTOM of the image, GL convention) to the codec's top-first NV12 with
+// stride 640 - the exact layout this codec was verified to accept (§14).
+// Integer BT.601 limited-range, the matrix the guest's display shader uses,
+// so what the host packs and what the guest unpacks describe the same
+// picture. Chroma comes from the 2x2 mean rather than the top-left pixel,
+// and the row flip costs one subtraction - which is why the capture unit
+// leaves orientation here instead of spending a blit or a copy on it.
+void rgbaToNv12(const byte *src, byte *dst) {
+	const int w = kVideoWidth, h = kVideoHeight;
+	byte *Y = dst;
+	byte *UV = dst + (size_t)w * h;
+	for (int row = 0; row < h; ++row) {
+		const byte *s = src + (size_t)(h - 1 - row) * w * 4;
+		byte *y = Y + (size_t)row * w;
+		for (int col = 0; col < w; ++col)
+			y[col] = (byte)(((66 * s[col * 4] + 129 * s[col * 4 + 1] + 25 * s[col * 4 + 2] + 128) >> 8) + 16);
+		if (row & 1)
+			continue; // NV12 chroma is half height; each pair of rows feeds one UV row
+		const byte *s2 = src + (size_t)(h - 2 - row) * w * 4; // the row below in the image
+		byte *uv = UV + (size_t)(row / 2) * w;
+		for (int col = 0; col < w; col += 2) {
+			const int r = (s[col * 4] + s[col * 4 + 4] + s2[col * 4] + s2[col * 4 + 4]) >> 2;
+			const int g = (s[col * 4 + 1] + s[col * 4 + 5] + s2[col * 4 + 1] + s2[col * 4 + 5]) >> 2;
+			const int b = (s[col * 4 + 2] + s[col * 4 + 6] + s2[col * 4 + 2] + s2[col * 4 + 6]) >> 2;
+			uv[col] = (byte)(((-38 * r - 74 * g + 112 * b + 512) >> 10) + 128);
+			uv[col + 1] = (byte)(((112 * r - 94 * g - 18 * b + 512) >> 10) + 128);
 		}
 	}
 }
@@ -704,6 +750,16 @@ void runTestBody(const Config &cfg) {
 			video.sendRoom = true;
 			video.transport = &transport;
 			videoOn = true;
+			if (cfg.capture) {
+				// Real pixels from the §6 path instead of the synthetic
+				// scene. Nothing here reads the framebuffer - that stays on
+				// the graphics thread - this thread only asks for whatever
+				// was last reaped.
+				video.rgba.resize((size_t)Coop::kCapBytes);
+				Coop::g_coopCaptureWant = true;
+				debug("coop selftest: capture source requested - frames will come from the "
+					"game framebuffer%s", cfg.gameTarget[0] ? " (the game= key autolaunches one)" : "");
+			}
 		}
 	}
 
@@ -808,6 +864,31 @@ void runTestBody(const Config &cfg) {
 			// few ms apart - so cap at the table, do not overrun it.
 			if (videoFramesFed >= (int)video.submitAt.size()) {
 				videoOn = false;
+			} else if (cfg.capture) {
+				// Capture mode: real pixels or a skipped tick, never a quiet
+				// fallback to the synthetic scene - a measurement that
+				// changes content when capture fails is not measuring what
+				// it says. A skipped tick costs the encoder nothing (no
+				// frame goes in, pts stays monotonic for the frames that do).
+				int64 capAt = 0;
+				if (!Coop::grabCapturedFrame(video.rgba.data(), &capAt)) {
+					++video.missedCapture;
+					if (video.missedCapture == 1)
+						warning("coop selftest: the capture path has produced no frame yet - "
+							"is a game running? (the marker's game= key autolaunches one)");
+				} else {
+					rgbaToNv12(video.rgba.data(), video.frame.data());
+					++video.captured;
+					video.submitAt[videoFramesFed] = nowUs();
+					if (!video.enc.submitFrame(video.frame.data(),
+							(int64)videoFramesFed * 1000000 / kVideoFps, videoAu, &video)) {
+						warning("coop selftest: the encoder failed at frame %d; video stops, the room does not",
+							videoFramesFed);
+						videoOn = false;
+					}
+					++videoFramesFed;
+					videoNextMs = videoStartMs + (int64)videoFramesFed * 1000 / kVideoFps;
+				}
 			} else {
 				renderVideoFrame(&video, videoFramesFed);
 				video.submitAt[videoFramesFed] = nowUs();
@@ -841,6 +922,16 @@ void runTestBody(const Config &cfg) {
 		video.enc.drain(500, videoAu, &video);
 		reportVideoRun(&video, videoFramesFed);
 		video.enc.close();
+		if (cfg.capture) {
+			// Stop the graphics thread from issuing more readbacks first,
+			// then report both sides: what the GPU path delivered and what
+			// the encoder actually consumed.
+			Coop::g_coopCaptureWant = false;
+			const Coop::CaptureStats cs = Coop::captureStats();
+			debug("coop selftest: host capture: %d readbacks issued, %d collected, %d not-ready, "
+					"%d map failures; encoder fed %d captured frames, %d ticks had no new frame",
+				cs.issues, cs.reaps, cs.missed, cs.mapFails, video.captured, video.missedCapture);
+		}
 	}
 	if (cfg.videoMode == 3 && decode.dec.isOpen()) {
 		// Whatever the room still owes us first - a final AU can sit in the
@@ -974,6 +1065,14 @@ bool grabVideoFrame(VideoMailbox *out, uint32 lastSeq, VideoRenderStats *stats) 
 	return true;
 }
 
+// The game the marker asked to autolaunch, kept outside the per-file Config
+// because android-vr-main reads it (to extend the scummvm_main command line)
+// while the run thread may not have even started yet. Set synchronously in
+// startSelfTestIfRequested; "" means leave the launcher alone.
+char g_coopGameTarget[64];
+
+const char *selfTestGameTarget() { return g_coopGameTarget; }
+
 bool startSelfTestIfRequested() {
 	const char *candidates[3];
 	int count = 0;
@@ -987,6 +1086,9 @@ bool startSelfTestIfRequested() {
 		Config cfg;
 		if (!readConfig(candidates[i], &cfg))
 			continue;
+		// Synchronous, before the thread: the caller of this function may
+		// read selfTestGameTarget() immediately, to decide the command line.
+		memcpy(g_coopGameTarget, cfg.gameTarget, sizeof(g_coopGameTarget));
 		// Its own thread: the render loop must not stall while the control plane
 		// round trip runs, and Session callbacks arrive on another thread anyway.
 		// Nothing is logged here because the caller runs before the backend is
