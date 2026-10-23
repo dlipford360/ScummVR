@@ -59,7 +59,9 @@ Transport::Transport()
 	  _queueCount(0),
 	  _droppedEvents(0),
 	  _badPackets(0),
-	  _cryptoDrops(0) {
+	  _cryptoDrops(0),
+	  _datagramsIn(0),
+	  _hellosSent(0) {
 	_code[0] = 0;
 	_secret[0] = 0;
 	_status[0] = 0;
@@ -79,6 +81,8 @@ bool Transport::open(const char *host, int port) {
 		return true;
 	if (!host || !host[0] || port <= 0 || port > 0xffff)
 		return false;
+
+	int family = AF_UNSPEC;	// the family getaddrinfo actually handed us, for the log
 
 	char portText[8];
 	int n = 0;
@@ -116,6 +120,7 @@ bool Transport::open(const char *host, int port) {
 			continue;
 		}
 		_fd = fd;
+		family = ai->ai_family;
 		break;
 	}
 	freeaddrinfo(addresses);
@@ -123,6 +128,26 @@ bool Transport::open(const char *host, int port) {
 	if (_fd < 0) {
 		warning("coop: could not connect a UDP socket to %s:%d", host, port);
 		return false;
+	}
+
+	// One line about what was actually built. Which address getaddrinfo picked and
+	// which local port the kernel chose is the first thing a bring-up log needs,
+	// because "no WELCOME" has at least three causes that look identical from here.
+	{
+		struct sockaddr_storage local;
+		socklen_t localLen = sizeof(local);
+		char localHost[NI_MAXHOST];
+		char localService[NI_MAXSERV];
+		localHost[0] = localService[0] = 0;
+		if (getsockname(_fd, (struct sockaddr *)&local, &localLen) == 0 &&
+			getnameinfo((const struct sockaddr *)&local, localLen, localHost, sizeof(localHost),
+				localService, sizeof(localService), NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
+			debug("coop: UDP socket open to %s:%d (family %d), local endpoint %s:%s",
+				host, port, family, localHost, localService);
+		} else {
+			debug("coop: UDP socket open to %s:%d (family %d), local endpoint unknown",
+				host, port, family);
+		}
 	}
 	return true;
 }
@@ -604,6 +629,7 @@ void Transport::receiveLoop() {
 		char line[Wire::kMaxHeaderBytes];
 		int len = 0;
 		bool sendControl = false;
+		bool sendingHello = false;
 
 		{
 			std::lock_guard<std::mutex> lock(_sendMutex);
@@ -611,14 +637,26 @@ void Transport::receiveLoop() {
 				lastHelloMs = now;
 				len = Wire::formatHello(line, sizeof(line), _code, _peerId, _secret);
 				sendControl = len > 0;
+				sendingHello = sendControl;
 			} else if (_code[0] && _ready && !_closed && now - lastPingMs >= kPingIntervalMs) {
 				lastPingMs = now;
 				len = Wire::formatPing(line, sizeof(line), _code, _peerId);
 				sendControl = len > 0;
 			}
 		}
-		if (sendControl)
-			sendTextFrame(line, len);
+		if (sendControl) {
+			if (sendingHello) {
+				if (sendTextFrame(line, len)) {
+					// First HELLO only, and it names the local endpoint: a room whose
+					// host never gets WELCOME needs to know whether the datagram left
+					// this device at all, and from which address family and port.
+					if (++_hellosSent == 1)
+						debug("coop: HELLO written for room %s as peer %u, %d bytes", _code, (unsigned)_peerId, len);
+				}
+			} else {
+				sendTextFrame(line, len);
+			}
+		}
 
 		if (_ready && !_closed && now - _lastPongMs > kLivenessMs) {
 			// The relay drops a binding after 30 s of silence; if we have not seen
@@ -638,8 +676,12 @@ void Transport::receiveLoop() {
 		if (ready > 0 && (pfd.revents & POLLIN)) {
 			byte packet[Wire::kMaxDatagramBytes];
 			const int received = (int)recv(_fd, packet, sizeof(packet), 0);
-			if (received > 0)
+			if (received > 0) {
+				// Counted before parsing: "nothing arrived" and "something arrived that
+				// we could not read" are different failures.
+				++_datagramsIn;
 				handleDatagram(packet, received);
+			}
 		} else if (ready > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
 			_closed = true;
 			noteStatus("socket error");

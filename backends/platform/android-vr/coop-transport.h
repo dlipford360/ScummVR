@@ -148,6 +148,15 @@ public:
 	// Inbound frames this transport could not authenticate: wrong key, rewritten
 	// header, truncated payload, or a sealed frame while no key was configured.
 	uint32 cryptoDrops() const { return _cryptoDrops; }
+	// Datagrams read from the socket, counted whether or not they parsed. Paired with
+	// hellosSent(), this is the difference between "nothing came back" and "something
+	// came back that we could not read" - which a client that never sees WELCOME
+	// cannot otherwise tell.
+	uint32 datagramsIn() const { return _datagramsIn; }
+	// HELLO datagrams written to the socket. hellosSent() > 0 with datagramsIn() == 0
+	// says the outbound direction is the broken one, which is a different diagnosis
+	// (and a different fix) than a parse or key failure.
+	uint32 hellosSent() const { return _hellosSent; }
 
 private:
 	static const int kQueueDepth = 64;
@@ -209,6 +218,8 @@ private:
 	std::atomic<uint32> _droppedEvents;
 	std::atomic<uint32> _badPackets;
 	std::atomic<uint32> _cryptoDrops;
+	std::atomic<uint32> _datagramsIn;
+	std::atomic<uint32> _hellosSent;
 };
 
 } // namespace Coop

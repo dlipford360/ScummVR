@@ -299,9 +299,18 @@ void runTestBody(const Config &cfg) {
 	if (!transport.isReady()) {
 		char status[Wire::kMaxHeaderBytes];
 		transport.statusText(status, sizeof(status));
-		warning("coop selftest: no WELCOME within 10 s (last relay line: %s). UDP reaches the relay "
-				"only outbound, so a silent firewall or a wrong advertised relay.host looks exactly like this",
-			status[0] ? status : "nothing at all");
+		// The counters ARE the diagnosis on this path, so print them even though the
+		// test failed. "no WELCOME" has at least three causes that look identical from
+		// the game side: hellos > 0 with datagrams in == 0 means the datagram left this
+		// device and nothing came back (firewall, wrong advertised relay.host, relay
+		// down); datagrams in > 0 with unparseable > 0 means the relay answered and this
+		// build could not read the answer; hellos == 0 means join() never got as far as
+		// writing anything.
+		warning("coop selftest: no WELCOME within 10 s (last relay line: %s). HELLO written %u, "
+			"datagrams in %u, unparseable %u, crypto drops %u, events dropped %u",
+			status[0] ? status : "nothing at all",
+			transport.hellosSent(), transport.datagramsIn(), transport.badPackets(),
+			transport.cryptoDrops(), transport.droppedEvents());
 		transport.close();
 		return;
 	}
@@ -369,9 +378,11 @@ void runTestBody(const Config &cfg) {
 	char status[Wire::kMaxHeaderBytes];
 	transport.statusText(status, sizeof(status));
 	debug("coop selftest: done after %d s - %u frames in (%u data, %u roster, %u control), "
-			"%d app frames and %d 4 KB frames sent, dropped events %u, bad packets %u, crypto drops %u",
+			"%d app frames and %d 4 KB frames sent, dropped events %u, bad packets %u, crypto drops %u, "
+			"HELLO written %u, datagrams in %u",
 		cfg.seconds, framesIn, dataIn, rosterIn, controlIn, appSeq, appSeq,
-		transport.droppedEvents(), transport.badPackets(), transport.cryptoDrops());
+		transport.droppedEvents(), transport.badPackets(), transport.cryptoDrops(),
+		transport.hellosSent(), transport.datagramsIn());
 	if (status[0])
 		debug("coop selftest: last relay status line: %s", status);
 	if (transport.cryptoDrops())
