@@ -53,11 +53,12 @@ namespace Coop {
 // prints the room code and invite, the other gets them typed into its marker
 // file. Secrets are never logged; lengths are.
 //
-// Honest limitation: the thread logs through g_system, so it must finish before
-// ScummVM tears its backend down. It always does on its own - 5 s warmup, 15 s for
-// the control plane, 10 s for HELLO, then at most 60 s joined - but quitting the app
-// mid-run still races that. This file is expected to come out of the tree once the
-// real entry point exists.
+// Honest limitation: the thread attaches itself to the JVM (the control plane is
+// Java), logs through g_system, and detaches on the way out, so quitting the app
+// mid-run races that teardown. It always finishes on its own - 5 s warmup, 15 s for
+// the control plane, 10 s for HELLO, then at most 60 s joined - but a quit inside
+// that window can abort in JNI::detachThread(). This file is expected to come out of
+// the tree once the real entry point exists.
 bool startSelfTestIfRequested();
 
 } // namespace Coop

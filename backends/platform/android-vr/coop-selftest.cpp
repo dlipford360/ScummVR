@@ -36,6 +36,12 @@
 #include "common/debug.h"
 #include "common/textconsole.h"
 
+#ifdef __ANDROID__
+// The control plane is the Java HTTP stack, which needs a JNIEnv on the calling
+// thread. See runTest() below.
+#include "backends/platform/android/jni-android.h"
+#endif
+
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -194,7 +200,7 @@ void benchSealing(const char *mediaKeyHex, const char *code, char roleTag, uint1
 		warning("coop selftest: seal bench round trip failed %d of %d times", kPairs - openedOk, kPairs);
 }
 
-void runTest(const Config &cfg) {
+void runTestBody(const Config &cfg) {
 	// The call site is before scummvm_main, so the backend is created but not yet
 	// initialised and the Java HTTP manager is not up yet. Waiting also keeps the
 	// test's logging away from the startup noise.
@@ -372,6 +378,28 @@ void runTest(const Config &cfg) {
 		warning("coop selftest: inbound frames failed authentication - a shared room key means every "
 				"participant can produce them, so check for another participant before suspecting the port");
 	transport.close();
+}
+
+// Attach this thread to the JVM before touching the control plane.
+//
+// The first device run crashed 5 s in, at the first control-plane call:
+//   PostRequest::start -> ConnectionManager::instance -> ConnectionManagerAndroid
+//   -> JNI::getEnv -> JNI::fetchEnv -> abort()
+// JNI::fetchEnv() calls GetEnv() and aborts when the answer is JNI_EDETACHED; it
+// deliberately does not attach, so every native thread that reaches the Java layer
+// must call attachThread() itself - which is what OSystem_Android's timer and audio
+// threads do. A std::thread is not attached by definition.
+//
+// The transport needs no JNIEnv (plain POSIX UDP), but the thread is one unit and
+// holding the attachment for its lifetime is simpler than attaching per call.
+void runTest(const Config &cfg) {
+#ifdef __ANDROID__
+	JNI::attachThread();
+#endif
+	runTestBody(cfg);
+#ifdef __ANDROID__
+	JNI::detachThread();
+#endif
 }
 
 } // namespace
