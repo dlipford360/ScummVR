@@ -37,6 +37,7 @@
 #include "common/textconsole.h"
 
 #include "backends/platform/android-vr/coop-encode.h"
+#include "backends/platform/android-vr/coop-decode.h"
 
 #ifdef __ANDROID__
 // The control plane is the Java HTTP stack, which needs a JNIEnv on the calling
@@ -50,6 +51,7 @@
 #include <chrono>
 #include <thread>
 #include <algorithm>
+#include <map>
 #include <vector>
 
 namespace Coop {
@@ -74,7 +76,8 @@ struct Config {
 	bool plaintext;
 	int seconds;
 	// 0 = no video, 1 = bench the encoder only (no room needed), 2 = encode and
-	// send 'V' frames to the room while joined (host role).
+	// send 'V' frames to the room while joined (host role), 3 = receive the
+	// host's 'V' frames and decode them (guest role).
 	int videoMode;
 };
 
@@ -133,8 +136,10 @@ bool readConfig(const char *path, Config *out) {
 				out->videoMode = 1;
 			else if (!strcmp(value, "send"))
 				out->videoMode = 2;
+			else if (!strcmp(value, "recv"))
+				out->videoMode = 3;
 			else
-				warning("coop selftest: video value must be \"bench\" or \"send\", got \"%s\"", value);
+				warning("coop selftest: video value must be \"bench\", \"send\" or \"recv\", got \"%s\"", value);
 		} else if (!strcmp(key, "seconds")) {
 			out->seconds = atoi(value);
 			if (out->seconds < 1)
@@ -452,6 +457,107 @@ void benchEncoder(int seconds) {
 	run.enc.close();
 }
 
+// ---------------------------------------------------------------- receive-side
+
+// video=recv: this device is a real guest of a real video host. Every 'V'
+// fragment feeds the wire reassembler; every complete AU feeds the decoder.
+// The number that matters is the same shape as the encoder's, mirrored:
+// AU-complete to decoded-frame callback, which is the guest's share of the
+// one-way budget. Display is deliberately not part of this - the self-test
+// thread has no render context - and saying so keeps the decode number honest
+// about what it proves.
+
+struct DecodeRun {
+	VideoDecoder dec;
+	Wire::FrameReassembler reassembler;
+	// frameId -> wall time at which the AU finished arriving. The host's pts
+	// is its own frame counter, not a shared clock, so the correlation key is
+	// the wire frameId, which both ends agree exists.
+	std::map<uint32, int64> completeAt;
+	std::vector<int64> latUs;
+	int vFragments, completeAUs, badHeaders, pushFails;
+
+	DecodeRun() : vFragments(0), completeAUs(0), badHeaders(0), pushFails(0) {}
+};
+
+void decodeCb(void *ctx, const byte *plane, int len, int64 ptsUs) {
+	DecodeRun *r = static_cast<DecodeRun *>(ctx);
+	// ptsUs is the frameId we pushed with. An unseen id means the decoder
+	// emitted something we did not feed it - worth knowing, not worth a crash.
+	std::map<uint32, int64>::iterator at = r->completeAt.find((uint32)ptsUs);
+	if (at != r->completeAt.end()) {
+		r->latUs.push_back(nowUs() - at->second);
+		r->completeAt.erase(at);
+	}
+	// Touch the buffer so the callback is not optimizable to nothing, and
+	// because a decode that produced zero bytes is not a decode.
+	(void)plane;
+	(void)len;
+}
+
+void feedVideoFragment(DecodeRun *r, const Transport::Event &event) {
+	if (event.payloadLen <= Wire::kFragHeaderBytes) {
+		++r->badHeaders;
+		return;
+	}
+	uint32 frameId = 0;
+	uint16 index = 0, count = 0;
+	if (!Wire::readFragmentHeader(event.payload, event.payloadLen, &frameId, &index, &count)) {
+		++r->badHeaders;
+		return;
+	}
+	++r->vFragments;
+
+	Wire::FrameReassembler::Complete done;
+	if (!r->reassembler.feed(frameId, index, count,
+			event.payload + Wire::kFragHeaderBytes,
+			event.payloadLen - Wire::kFragHeaderBytes, &done))
+		return;
+
+	++r->completeAUs;
+	r->completeAt[done.frameId] = nowUs();
+	if (!r->dec.push(done.data, (int)done.len, (int64)done.frameId, decodeCb, r)) {
+		++r->pushFails;
+		if (r->pushFails == 1)
+			warning("coop selftest: the decoder refused AU %u - video stops being measured, "
+					"the room keeps running", done.frameId);
+	}
+}
+
+void reportDecodeRun(DecodeRun *r, int seconds) {
+	if (r->completeAUs == 0) {
+		warning("coop selftest: received %u V fragments but reassembled no complete AU - "
+				"was a video host present, and did it start before this guest?",
+				(uint32)r->vFragments);
+		return;
+	}
+	if (r->dec.decoded() == 0) {
+		warning("coop selftest: %d AUs fed to the decoder, none decoded - the stream may "
+				"not start at a keyframe", r->completeAUs);
+		return;
+	}
+	if (!r->latUs.empty()) {
+		std::sort(r->latUs.begin(), r->latUs.end());
+		const size_t n = r->latUs.size();
+		debug("coop selftest: guest decode: %d fragments in, %d AUs complete, %d frames decoded "
+				"(%d x %d, color %d, stride %d slice %d), AU-complete-to-decoded p50 %lld us "
+				"p95 %lld us max %lld us, over %d s",
+			r->vFragments, r->completeAUs, r->dec.decoded(),
+			r->dec.width(), r->dec.height(), r->dec.colorFormat(), r->dec.stride(),
+			r->dec.sliceHeight(),
+			(long long)r->latUs[n / 2], (long long)r->latUs[(n * 95) / 100],
+			(long long)r->latUs.back(), seconds);
+	} else {
+		// Decoded frames whose ids we could not match: still proof of decode,
+		// but the latency column stays empty rather than inventing numbers.
+		debug("coop selftest: guest decode: %d AUs in, %d decoded, but no AU->frame "
+				"correlation was possible - no latency reported", r->completeAUs, r->dec.decoded());
+	}
+	if (r->pushFails || r->badHeaders)
+		warning("coop selftest: guest decode had %d refused AUs and %d malformed fragment headers",
+			r->pushFails, r->badHeaders);
+}
+
 void runTestBody(const Config &cfg) {
 	// The call site is before scummvm_main, so the backend is created but not yet
 	// initialised and the Java HTTP manager is not up yet. Waiting also keeps the
@@ -591,6 +697,24 @@ void runTestBody(const Config &cfg) {
 			videoOn = true;
 		}
 	}
+
+	// video=recv: the mirror run. This device is a guest; the video host is
+	// whatever else is in the room (the Mac harness today, a second headset
+	// when there is one). There is nothing to set up beyond opening the
+	// decoder - the bitstream carries its own description - but the role
+	// check is not decorative: as a host this device would receive nothing,
+	// because the relay does not echo a peer's own frames back to it.
+	DecodeRun decode;
+	if (cfg.videoMode == 3) {
+		if (cfg.asHost) {
+			warning("coop selftest: video=recv needs role=guest (a host would receive nothing); skipping");
+		} else if (!decode.dec.open(kVideoWidth, kVideoHeight)) {
+			warning("coop selftest: no usable H.264 decoder on this device");
+		} else {
+			debug("coop selftest: decoder open for %d x %d, waiting for the room's video host",
+				kVideoWidth, kVideoHeight);
+		}
+	}
 	const int64 videoStartMs = nowMs();
 	int videoFramesFed = 0;
 	int64 videoNextMs = videoStartMs;
@@ -609,8 +733,15 @@ void runTestBody(const Config &cfg) {
 			++framesIn;
 			if (event.kind == Wire::kRecvData) {
 				++dataIn;
-				debug("coop selftest: frame '%c' from peer %u, %d bytes, envelope 0x%02x",
-					event.header.type, event.header.peerId, event.payloadLen, event.envelope);
+				// In recv mode the V stream is the measurement, and at 30 fps
+				// it is also ~27 datagrams a second - per-fragment debug would
+				// bury every other line. The DecodeRun counters are the report.
+				if (event.header.type == 'V' && decode.dec.isOpen()) {
+					feedVideoFragment(&decode, event);
+				} else {
+					debug("coop selftest: frame '%c' from peer %u, %d bytes, envelope 0x%02x",
+						event.header.type, event.header.peerId, event.payloadLen, event.envelope);
+				}
 			} else if (event.kind == Wire::kRecvRoster) {
 				++rosterIn;
 				debug("coop selftest: roster: %s", event.text);
@@ -676,7 +807,15 @@ void runTestBody(const Config &cfg) {
 				videoNextMs = videoStartMs + (int64)videoFramesFed * 1000 / kVideoFps;
 			}
 		}
-		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		// The same lesson the encoder bench learned on device: outputs must be
+		// polled between feeds, not only at feed ticks, or the measurement
+		// includes the poll cadence itself. In recv mode the loop's usual nap
+		// *is* the drain - it waits the same wall time and fires any frame the
+		// codec finished meanwhile.
+		if (decode.dec.isOpen())
+			decode.dec.drain(10, decodeCb, &decode);
+		else
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
 	}
 
 	char status[Wire::kMaxHeaderBytes];
@@ -688,6 +827,19 @@ void runTestBody(const Config &cfg) {
 		video.enc.drain(500, videoAu, &video);
 		reportVideoRun(&video, videoFramesFed);
 		video.enc.close();
+	}
+	if (cfg.videoMode == 3 && decode.dec.isOpen()) {
+		// Whatever the room still owes us first - a final AU can sit in the
+		// socket buffer after the timer expires - then whatever the decoder
+		// still holds. Skipping either one loses the tail of the run.
+		Transport::Event event;
+		while (transport.pollEvent(&event)) {
+			if (event.kind == Wire::kRecvData && event.header.type == 'V')
+				feedVideoFragment(&decode, event);
+		}
+		decode.dec.drain(1000, decodeCb, &decode);
+		reportDecodeRun(&decode, cfg.seconds);
+		decode.dec.close();
 	}
 
 	debug("coop selftest: done after %d s - %u frames in (%u data, %u roster, %u control), "
