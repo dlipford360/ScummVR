@@ -107,6 +107,10 @@ public:
 	bool pending() const;
 	// Whether the most recently finished request succeeded.
 	bool lastRequestOk() const;
+	// Which of the two result sets the last response actually filled in: a guest
+	// join never carries owner credentials, and a failed request fills in neither.
+	bool haveParticipant() const;
+	bool haveOwnerCredentials() const;
 
 	// Reads one control-plane response into the structs above and evaluates the
 	// version gate. Split out because it is pure: it can be fed the relay's real

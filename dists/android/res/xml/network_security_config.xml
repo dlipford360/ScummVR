@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+	TLS trust for the coop control plane.
+
+	The relay hands out the room's media key and each participant's session secret,
+	so its control plane has to be HTTPS on any network you do not own. Android
+	blocks cleartext for targetSdk >= 28 outright, so there is nothing to relax here:
+	what this file does is make a *LAN* certificate chain trusted, so the relay can
+	serve HTTPS on a private address without a public certificate.
+
+	debug-overrides, deliberately: it applies only to a debuggable APK, so a release
+	build falls back to the system trust anchors and a real certificate. Generate the
+	chain with coop-relay/scripts/lan-cert.sh, which writes the CA to
+	res/raw/coop_relay_ca.pem (referenced below as @raw/coop_relay_ca) and prints the
+	relay's TLS_*_FILE settings.
+
+	One caveat worth knowing before debugging a trust failure: this fork's
+	HTTPManager installs TLSSocketFactory as the default, and its LETrustManager
+	delegates to the platform trust manager obtained with a null KeyStore. On Android
+	that factory does honour this configuration, but the delegation is not something
+	verified on a Quest yet - if the coop self-test reports a TLS failure, that
+	indirection is the first suspect, and a certificate from a public authority under
+	a real hostname needs none of this.
+-->
+<network-security-config>
+	<debug-overrides>
+		<trust-anchors>
+			<certificates src="@raw/coop_relay_ca" />
+			<certificates src="system" />
+		</trust-anchors>
+	</debug-overrides>
+</network-security-config>

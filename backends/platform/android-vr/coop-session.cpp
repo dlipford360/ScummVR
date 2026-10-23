@@ -52,6 +52,17 @@ void copyText(const Common::String &src, char *out, int capacity) {
 	out[i] = 0;
 }
 
+// Same bound, but between two fixed buffers: the guarded reason fields are char
+// arrays, and routing them through Common::String would allocate on every read.
+void copyChars(const char *src, char *out, int capacity) {
+	if (!out || capacity <= 0 || !src)
+		return;
+	int i = 0;
+	for (; i < capacity - 1 && src[i]; ++i)
+		out[i] = src[i];
+	out[i] = 0;
+}
+
 // Room codes are the one piece of caller input that ends up inside a URL, so it
 // is validated instead of pasted: 4..8 characters of [A-Z0-9], as the relay defines them.
 bool isRoomCode(const char *code) {
@@ -145,6 +156,55 @@ bool Session::closeRoom(const char *code, const char *ownerSecret) {
 	const Field fields[] = { { "ownerSecret", ownerSecret } };
 	// Zero role: closing a room does not make us a participant of it.
 	return post(path.c_str(), fields, 1, 0);
+}
+
+bool Session::pending() const {
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _pending;
+}
+
+bool Session::lastRequestOk() const {
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _lastOk;
+}
+
+bool Session::haveParticipant() const {
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _haveParticipant;
+}
+
+bool Session::haveOwnerCredentials() const {
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _haveOwner;
+}
+
+bool Session::gateOk() const {
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _gateOk;
+}
+
+void Session::copyParticipant(Participant *out) const {
+	if (!out)
+		return;
+	std::lock_guard<std::mutex> lock(_mutex);
+	*out = _participant;
+}
+
+void Session::copyOwnerCredentials(OwnerCredentials *out) const {
+	if (!out)
+		return;
+	std::lock_guard<std::mutex> lock(_mutex);
+	*out = _owner;
+}
+
+void Session::copyGateReason(char *out, int capacity) const {
+	std::lock_guard<std::mutex> lock(_mutex);
+	copyChars(_gateReason, out, capacity);
+}
+
+void Session::copyError(char *out, int capacity) const {
+	std::lock_guard<std::mutex> lock(_mutex);
+	copyChars(_error, out, capacity);
 }
 
 bool Session::post(const char *path, const Field *fields, int fieldCount, char roleTag) {

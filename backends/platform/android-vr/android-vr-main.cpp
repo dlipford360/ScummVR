@@ -50,6 +50,7 @@
 #include "common/events.h"
 #include "common/config-manager.h"
 #include "backends/platform/android/android.h"
+#include "backends/platform/android-vr/coop-selftest.h"
 
 #define LOG_TAG "ScummVM_VR_Main"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -1342,6 +1343,12 @@ static void *scummvmThreadFunc(void *arg) {
 	std::string themeOpt = std::string("--themepath=") + themesDirPath();
 	const char *argv[] = { "scummvm", configOpt.c_str(), themeOpt.c_str() };
 	int argc = 3;
+
+	// Coop bring-up probe: does nothing unless /sdcard/scummvm-coop-test.txt is
+	// present. See coop-selftest.h. It runs on its own thread and always finishes
+	// by itself - 5 s warmup, 15 s for the control plane, 10 s for HELLO, then at
+	// most 60 s joined.
+	Coop::startSelfTestIfRequested();
 
 	int result = scummvm_main(argc, argv);
 	// ScummVM is tearing down its OSystem; stop pushing events immediately
