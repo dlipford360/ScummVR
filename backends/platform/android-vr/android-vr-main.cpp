@@ -51,6 +51,7 @@
 #include "common/config-manager.h"
 #include "backends/platform/android/android.h"
 #include "backends/platform/android-vr/coop-selftest.h"
+#include "backends/platform/android-vr/coop-video-display.h"
 
 #define LOG_TAG "ScummVM_VR_Main"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -87,6 +88,27 @@ static const char *kScreenFrag =
 	"out vec4 color;\n"
 	"void main() { color = texture(tex, vUV); }\n";
 
+// Same quad and vertex shader, fed by the guest decoder's NV12 planes instead
+// of a composed RGBA texture: two samplers (GL_R8 luma, GL_RG8 interleaved
+// chroma) and the usual BT.601 limited-range matrix. Full-range content
+// (unflagged synthetic encodes) shifts slightly; the stream's own colr would
+// pick the matrix, which is a real-render concern, not this proof's.
+static const char *kScreenFragYUV =
+	"#version 300 es\n"
+	"precision mediump float;\n"
+	"in vec2 vUV;\n"
+	"uniform sampler2D texY;\n"
+	"uniform sampler2D texUV;\n"
+	"out vec4 color;\n"
+	"void main() {\n"
+	"  float y = texture(texY, vUV).r - (16.0/255.0);\n"
+	"  vec2 c = texture(texUV, vUV).rg - vec2(128.0/255.0);\n"
+	"  float r = 1.164*y + 1.596*c.y;\n"
+	"  float g = 1.164*y - 0.813*c.y - 0.392*c.x;\n"
+	"  float b = 1.164*y + 2.017*c.x;\n"
+	"  color = vec4(clamp(r,0.0,1.0), clamp(g,0.0,1.0), clamp(b,0.0,1.0), 1.0);\n"
+	"}\n";
+
 // Floating UI buttons shown around the virtual screen (see initUIButtons)
 struct UIButtonDesc { float cx, cy, hw, hh; };
 enum { kBtnMenu = 0, kBtnZoomIn, kBtnZoomOut, kBtnCount };
@@ -107,6 +129,14 @@ struct VRApp {
 	GLuint scummvmTexture;     // shared texture (written by ScummVM, read by VR)
 	pthread_t scummvmThread;
 	volatile bool scummvmRunning;
+
+	// Guest coop video display (coop-video-display.h). The mailbox is filled
+	// by the decoder's thread; only this (VR) thread touches the GL objects
+	// below, so no GL handle ever crosses a thread.
+	GLuint videoTexY, videoTexUV, videoProgram;
+	int videoW, videoH;        // texture extent, rebuilt if the stream size changes
+	uint32 videoLastSeq;       // mailbox seq of the frame currently on the quad
+	bool videoProgramTried;
 
 	XrInstance instance;
 	XrSystemId system;
@@ -521,13 +551,93 @@ static void initScreenQuad(VRApp *a) {
 	LOGI("Virtual screen quad initialized (using shared texture)");
 }
 
+// Guest coop video on the virtual screen: take the newest decoded NV12 frame
+// from the decoder thread's mailbox and keep it on GL textures owned solely
+// by this thread. Returns true when the quad should show video this frame.
+// The whole path is deliberately dumb: latest-frame overwrite (the mailbox's
+// policy), plain texture uploads (0.46 MB at 30 fps is nothing), and no
+// shader or texture churn per frame.
+static bool updateCoopVideo(VRApp *a) {
+	if (!Coop::g_coopVideoDisplayWant)
+		return false;
+
+	Coop::VideoMailbox frame;
+	Coop::VideoRenderStats stats;
+	if (!Coop::grabVideoFrame(&frame, a->videoLastSeq, &stats))
+		return a->videoLastSeq != 0; // nothing new, but the last frame stays shown
+
+	if (!a->videoProgramTried) {
+		a->videoProgramTried = true;
+		GLuint vs = compileShader(GL_VERTEX_SHADER, kScreenVert);
+		GLuint fs = compileShader(GL_FRAGMENT_SHADER, kScreenFragYUV);
+		a->videoProgram = glCreateProgram();
+		glAttachShader(a->videoProgram, vs);
+		glAttachShader(a->videoProgram, fs);
+		glLinkProgram(a->videoProgram);
+		glDeleteShader(vs); glDeleteShader(fs);
+		GLint ok = 0;
+		glGetProgramiv(a->videoProgram, GL_LINK_STATUS, &ok);
+		if (!ok) {
+			LOGE("coop video shader failed to link - the quad will keep the game scene");
+			a->videoProgram = 0;
+		}
+	}
+	if (!a->videoProgram)
+		return false;
+
+	if ((int)frame.seq && (frame.width != a->videoW || frame.height != a->videoH)) {
+		if (a->videoTexY) glDeleteTextures(1, &a->videoTexY);
+		if (a->videoTexUV) glDeleteTextures(1, &a->videoTexUV);
+		glGenTextures(1, &a->videoTexY);
+		glGenTextures(1, &a->videoTexUV);
+		for (int t = 0; t < 2; ++t) {
+			GLuint tex = t ? a->videoTexUV : a->videoTexY;
+			glBindTexture(GL_TEXTURE_2D, tex);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		}
+		a->videoW = frame.width;
+		a->videoH = frame.height;
+		glBindTexture(GL_TEXTURE_2D, 0);
+	}
+
+	// The codec's stride, not ours: UNPACK_ROW_LENGTH is in pixels and skips
+	// any row padding, so a padded stream uploads correctly without a copy.
+	glPixelStorei(GL_UNPACK_ROW_LENGTH, frame.stride);
+	glBindTexture(GL_TEXTURE_2D, a->videoTexY);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, frame.width, frame.height, 0,
+		GL_RED, GL_UNSIGNED_BYTE, frame.frame.data());
+	glBindTexture(GL_TEXTURE_2D, a->videoTexUV);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, frame.width / 2, frame.height / 2, 0,
+		GL_RG, GL_UNSIGNED_BYTE, frame.frame.data() + (size_t)frame.stride * frame.sliceHeight);
+	glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	a->videoLastSeq = frame.seq;
+	LOGD("coop video: frame %u (%dx%d, stride %d slice %d) uploaded, decode-to-upload %lld us",
+		frame.seq, frame.width, frame.height, frame.stride, frame.sliceHeight,
+		(long long)stats.decodeToUploadUs);
+	return true;
+}
+
 static void drawScreen(VRApp *a, const float *viewProj) {
-	glUseProgram(a->screenProgram);
+	const bool showVideo = updateCoopVideo(a);
+	glUseProgram(showVideo ? a->videoProgram : a->screenProgram);
 	// MVP = viewProj * identity (screen is already in world coords)
 	glUniformMatrix4fv(a->screenMVPLoc, 1, GL_FALSE, viewProj);
 	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, a->testTexture);
-	glUniform1i(a->screenTexLoc, 0);
+	if (showVideo) {
+		glBindTexture(GL_TEXTURE_2D, a->videoTexY);
+		glUniform1i(glGetUniformLocation(a->videoProgram, "texY"), 0);
+		glActiveTexture(GL_TEXTURE1);
+		glBindTexture(GL_TEXTURE_2D, a->videoTexUV);
+		glUniform1i(glGetUniformLocation(a->videoProgram, "texUV"), 1);
+	} else {
+		glBindTexture(GL_TEXTURE_2D, a->testTexture);
+		glUniform1i(a->screenTexLoc, 0);
+	}
 
 	glBindBuffer(GL_ARRAY_BUFFER, a->screenVBO);
 	glEnableVertexAttribArray(0);

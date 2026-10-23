@@ -25,6 +25,7 @@
 #define FORBIDDEN_SYMBOL_ALLOW_ALL
 
 #include "backends/platform/android-vr/coop-selftest.h"
+#include "backends/platform/android-vr/coop-video-display.h"
 
 #include "common/scummsys.h"
 
@@ -79,6 +80,9 @@ struct Config {
 	// send 'V' frames to the room while joined (host role), 3 = receive the
 	// host's 'V' frames and decode them (guest role).
 	int videoMode;
+	// With videoMode 3, also hand the decoded frames to the VR thread so the
+	// virtual screen quad shows the host's video (display = true).
+	bool display;
 };
 
 void trim(char *text) {
@@ -140,6 +144,8 @@ bool readConfig(const char *path, Config *out) {
 				out->videoMode = 3;
 			else
 				warning("coop selftest: video value must be \"bench\", \"send\" or \"recv\", got \"%s\"", value);
+		} else if (!strcmp(key, "display")) {
+			out->display = !strcmp(value, "true") || atoi(value) != 0;
 		} else if (!strcmp(key, "seconds")) {
 			out->seconds = atoi(value);
 			if (out->seconds < 1)
@@ -491,8 +497,11 @@ void decodeCb(void *ctx, const byte *plane, int len, int64 ptsUs) {
 	}
 	// Touch the buffer so the callback is not optimizable to nothing, and
 	// because a decode that produced zero bytes is not a decode.
-	(void)plane;
-	(void)len;
+	// With display wanted, the frame also goes to the VR thread's mailbox -
+	// the layout values are the codec's published ones, deliberately.
+	if (len > 0)
+		publishVideoFrame(plane, len, nowUs(), r->dec.width(), r->dec.height(),
+			r->dec.stride(), r->dec.sliceHeight());
 }
 
 void feedVideoFragment(DecodeRun *r, const Transport::Event &event) {
@@ -713,6 +722,11 @@ void runTestBody(const Config &cfg) {
 		} else {
 			debug("coop selftest: decoder open for %d x %d, waiting for the room's video host",
 				kVideoWidth, kVideoHeight);
+			if (cfg.display) {
+				g_coopVideoDisplayWant = true;
+				debug("coop selftest: display requested - the VR screen quad will show the "
+						"received video as frames decode");
+			}
 		}
 	}
 	const int64 videoStartMs = nowMs();
@@ -840,6 +854,31 @@ void runTestBody(const Config &cfg) {
 		decode.dec.drain(1000, decodeCb, &decode);
 		reportDecodeRun(&decode, cfg.seconds);
 		decode.dec.close();
+		// The quad goes back to the local scene the moment measuring stops.
+		// (The VR thread keeps the last uploaded texture until then; it only
+		// consults the flag while drawing.)
+		if (cfg.display)
+			g_coopVideoDisplayWant = false;
+	}
+
+	if (cfg.display && cfg.videoMode == 3) {
+		// The render half of the chain, from the VR thread's counters: frames
+		// it actually uploaded, and the decode-callback-to-upload delay. That
+		// delay is what the render side adds to the end-to-end number.
+		std::lock_guard<std::mutex> lock(g_coopVideo.m);
+		if (!g_coopVideo.latUs.empty()) {
+			std::sort(g_coopVideo.latUs.begin(), g_coopVideo.latUs.end());
+			const size_t n = g_coopVideo.latUs.size();
+			debug("coop selftest: guest render: %d frames uploaded to the screen quad "
+					"(of %d decoded), decode-to-upload p50 %lld us p95 %lld us max %lld us",
+				g_coopVideo.stats.rendered, g_coopVideo.stats.decodedTo,
+				(long long)g_coopVideo.latUs[n / 2],
+				(long long)g_coopVideo.latUs[(n * 95) / 100],
+				(long long)g_coopVideo.latUs.back());
+		} else {
+			warning("coop selftest: display was requested but the VR thread never picked up "
+					"a frame - the screen quad did not change");
+		}
 	}
 
 	debug("coop selftest: done after %d s - %u frames in (%u data, %u roster, %u control), "
@@ -879,6 +918,61 @@ void runTest(const Config &cfg) {
 }
 
 } // namespace
+
+// The render hand-off. Defined here (inside namespace Coop, outside the
+// file-local one) because the producer side belongs with whoever drives the
+// decoder; the VR thread links against grabVideoFrame.
+VideoMailbox g_coopVideo;
+volatile bool g_coopVideoDisplayWant = false;
+
+void publishVideoFrame(const byte *plane, int len, int64 decodedAtUs,
+	int width, int height, int stride, int sliceHeight) {
+	if (!g_coopVideoDisplayWant || width <= 0 || height <= 0)
+		return;
+	// NV12 as the codec laid it out: a stride x sliceHeight luma plane plus
+	// an interleaved UV plane of the same stride and half the slice height.
+	// Anything else this unit has not seen from a Quest codec, so say so
+	// once through the counters rather than copying bytes we would misread.
+	if (stride * sliceHeight + stride * (sliceHeight / 2) > len)
+		return;
+
+	std::lock_guard<std::mutex> lock(g_coopVideo.m);
+	++g_coopVideo.stats.decodedTo;
+	const size_t bytes = (size_t)stride * sliceHeight * 3 / 2;
+	if (g_coopVideo.frame.size() != bytes)
+		g_coopVideo.frame.resize(bytes);
+	memcpy(g_coopVideo.frame.data(), plane, bytes);
+	g_coopVideo.width = width;
+	g_coopVideo.height = height;
+	g_coopVideo.stride = stride;
+	g_coopVideo.sliceHeight = sliceHeight;
+	g_coopVideo.publishedAtUs = decodedAtUs;
+	g_coopVideo.haveNew = true;
+	++g_coopVideo.seq;
+}
+
+bool grabVideoFrame(VideoMailbox *out, uint32 lastSeq, VideoRenderStats *stats) {
+	std::lock_guard<std::mutex> lock(g_coopVideo.m);
+	if (!g_coopVideo.seq || g_coopVideo.seq == lastSeq)
+		return false;
+	out->frame.swap(g_coopVideo.frame); // leaves the source empty; re-resized on the next publish
+	out->seq = g_coopVideo.seq;
+	out->publishedAtUs = g_coopVideo.publishedAtUs;
+	out->width = g_coopVideo.width;
+	out->height = g_coopVideo.height;
+	out->stride = g_coopVideo.stride;
+	out->sliceHeight = g_coopVideo.sliceHeight;
+
+	stats->decodedTo = g_coopVideo.stats.decodedTo;
+	++g_coopVideo.stats.rendered;
+	stats->rendered = g_coopVideo.stats.rendered;
+	const int64 now = std::chrono::duration_cast<std::chrono::microseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+	stats->decodeToUploadUs = now - g_coopVideo.publishedAtUs;
+	stats->uploadWallUs = now;
+	g_coopVideo.latUs.push_back(stats->decodeToUploadUs);
+	return true;
+}
 
 bool startSelfTestIfRequested() {
 	const char *candidates[3];
