@@ -89,6 +89,79 @@ const JNINativeMethod NetJNI::_natives_request[] = {
 
 bool NetJNI::_init = false;
 
+jobject NetJNI::_classLoader = nullptr;
+jmethodID NetJNI::_MID_classLoader_loadClass = 0;
+
+void NetJNI::setClassLoader(JNIEnv *env, jobject loader) {
+	if (!loader || _classLoader) {
+		return;
+	}
+
+	jclass loaderClass = env->FindClass("java/lang/ClassLoader");
+	if (!loaderClass) {
+		if (env->ExceptionCheck())
+			env->ExceptionClear();
+		LOGE("Can't find java/lang/ClassLoader");
+		return;
+	}
+
+	_MID_classLoader_loadClass = env->GetMethodID(loaderClass, "loadClass",
+		"(Ljava/lang/String;)Ljava/lang/Class;");
+	env->DeleteLocalRef(loaderClass);
+
+	if (!_MID_classLoader_loadClass) {
+		if (env->ExceptionCheck())
+			env->ExceptionClear();
+		LOGE("Can't find method ID loadClass");
+		return;
+	}
+
+	_classLoader = env->NewGlobalRef(loader);
+}
+
+jclass NetJNI::findClass(JNIEnv *env, const char *name) {
+	jclass cls = env->FindClass(name);
+	if (cls) {
+		return cls;
+	}
+
+	// FindClass has already thrown NoClassDefFoundError; clear it before making
+	// another call, or the pending exception turns the next one into an error too.
+	if (env->ExceptionCheck()) {
+		env->ExceptionDescribe();
+		env->ExceptionClear();
+	}
+
+	if (!_classLoader || !_MID_classLoader_loadClass) {
+		return 0;
+	}
+
+	// loadClass wants the binary name: "org/scummvm/..." -> "org.scummvm..."
+	char dotted[512];
+	int i = 0;
+	for (; name[i] && i < 511; ++i) {
+		dotted[i] = (name[i] == '/') ? '.' : name[i];
+	}
+	if (name[i]) {
+		LOGE("Class name too long: %s", name);
+		return 0;
+	}
+	dotted[i] = 0;
+
+	jstring className = env->NewStringUTF(dotted);
+	jclass loaded = (jclass) env->CallObjectMethod(_classLoader,
+		_MID_classLoader_loadClass, className);
+	env->DeleteLocalRef(className);
+
+	if (env->ExceptionCheck()) {
+		env->ExceptionDescribe();
+		env->ExceptionClear();
+		return 0;
+	}
+
+	return loaded;
+}
+
 void NetJNI::init(JNIEnv *env) {
 	if (_init) {
 		return;
@@ -116,8 +189,16 @@ void NetJNI::init(JNIEnv *env) {
             abort();                                                         \
         }                                                                    \
     } while (0)
+#define FIND_CLASS(name) do {                                                \
+    cls = findClass(env, name);                                              \
+        if (cls == 0) {                                                      \
+            LOGE("Can't find class " name);                                  \
+            abort();                                                         \
+        }                                                                    \
+    } while (0)
 
-	jclass cls = env->FindClass("java/net/URL");
+	jclass cls;
+	FIND_CLASS("java/net/URL");
 	_CLS_URL = (jclass)env->NewGlobalRef(cls);
 
 	FIND_CONSTRUCTOR(url_, "(Ljava/lang/String;)");
@@ -128,7 +209,7 @@ void NetJNI::init(JNIEnv *env) {
 
 	env->DeleteLocalRef(cls);
 
-	cls = env->FindClass("org/scummvm/scummvm/net/SSocket");
+	FIND_CLASS("org/scummvm/scummvm/net/SSocket");
 	_CLS_Socket = (jclass)env->NewGlobalRef(cls);
 
 	FIND_CONSTRUCTOR(socket_, "(Ljava/lang/String;)");
@@ -140,7 +221,7 @@ void NetJNI::init(JNIEnv *env) {
 	env->DeleteLocalRef(cls);
 
 #ifdef USE_HTTP
-	cls = env->FindClass("org/scummvm/scummvm/net/HTTPManager");
+	FIND_CLASS("org/scummvm/scummvm/net/HTTPManager");
 	_CLS_HTTPManager = (jclass)env->NewGlobalRef(cls);
 
 	FIND_CONSTRUCTOR(manager_, "()");
@@ -150,7 +231,7 @@ void NetJNI::init(JNIEnv *env) {
 
 	env->DeleteLocalRef(cls);
 
-	cls = env->FindClass("org/scummvm/scummvm/net/HTTPRequest");
+	FIND_CLASS("org/scummvm/scummvm/net/HTTPRequest");
 	_CLS_HTTPRequest = (jclass)env->NewGlobalRef(cls);
 
 	if (env->RegisterNatives(cls, _natives_request, ARRAYSIZE(_natives_request)) < 0) {
@@ -169,6 +250,7 @@ void NetJNI::init(JNIEnv *env) {
 #undef FIND_FIELD
 #undef FIND_METHOD
 #undef FIND_CONSTRUCTOR
+#undef FIND_CLASS
 
 	_init = true;
 }

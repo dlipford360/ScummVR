@@ -35,9 +35,31 @@ class NetJNI {
 	friend class AndroidURL;
 
 public:
+	/**
+	 * Install the class loader used to resolve the org.scummvm.* classes in init().
+	 *
+	 * JNIEnv::FindClass resolves a class with the class loader of the *caller's*
+	 * frame, so on a thread ScummVM created itself it returns null and throws for
+	 * application classes - the platform ones (java.net.URL, java.lang.ClassLoader)
+	 * still resolve. The classic port does not need this because it bootstraps from
+	 * Java; the VR port bootstraps from native code and does. Call it from a thread
+	 * that can already see an application object (any object's class knows its own
+	 * loader) before init().
+	 */
+	static void setClassLoader(JNIEnv *env, jobject loader);
+
 	static void init(JNIEnv *env);
 
 private:
+	/**
+	 * FindClass, with the fallback described on setClassLoader(). Returns a local
+	 * reference, like FindClass, or null when neither route found the class.
+	 */
+	static jclass findClass(JNIEnv *env, const char *name);
+
+	static jobject     _classLoader;
+	static jmethodID _MID_classLoader_loadClass;
+
 	static jclass    _CLS_URL;
 
 	static jmethodID _MID_url_init;

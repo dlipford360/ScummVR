@@ -916,6 +916,28 @@ bool JNI::createVR(JNIEnv *env, jobject scummvmObj, jobject assetManager) {
 	_MID_deinitSurface = 0;
 	_MID_eglVersion = 0;
 
+	// Resolve the network JNI bindings. The classic port does this at the end of
+	// JNI::init(), which runs on a Java thread; createVR never did it at all, so
+	// NetJNI's class cache was empty and the first HTTP request aborted in
+	// NewObject(NULL jclass) - USE_HTTP has not worked in the VR port until now.
+	//
+	// Doing it here needs help: this thread was created by ScummVM, and FindClass
+	// resolves an application class with the class loader of the caller's frame, so it
+	// returns null for org.scummvm.* (platform classes like java.net.URL still work).
+	// cls is a java.lang.Class instance, and every class object knows the loader that
+	// defined it, so that is the loader to hand to NetJNI.
+	{
+		jclass classClass = env->FindClass("java/lang/Class");
+		jmethodID getClassLoader = env->GetMethodID(classClass, "getClassLoader",
+			"()Ljava/lang/ClassLoader;");
+		jobject loader = env->CallObjectMethod(cls, getClassLoader);
+		env->DeleteLocalRef(classClass);
+
+		Networking::NetJNI::setClassLoader(env, loader);
+		env->DeleteLocalRef(loader);
+	}
+	Networking::NetJNI::init(env);
+
 	env->DeleteLocalRef(cls);
 
 	// VR mode: no EGL Java objects
