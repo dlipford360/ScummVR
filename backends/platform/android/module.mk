@@ -31,6 +31,10 @@ VR_OBJS := \
 	platform/android-vr/openxr-session.o \
 	platform/android-vr/openxr-input.o \
 	platform/android-vr/vr-screen-geometry.o \
+	platform/android-vr/coop-wire.o \
+	platform/android-vr/coop-seal.o \
+	platform/android-vr/coop-transport.o \
+	platform/android-vr/coop-session.o \
 	platform/android-vr/android-vr-main.o \
 	platform/android-vr/android_native_app_glue.o
 VR_OBJS := $(addprefix $(VR_MODULE)/, $(VR_OBJS))
