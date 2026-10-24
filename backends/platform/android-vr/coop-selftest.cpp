@@ -54,6 +54,7 @@
 #include <thread>
 #include <algorithm>
 #include <map>
+#include <set>
 #include <vector>
 
 namespace Coop {
@@ -275,11 +276,15 @@ struct VideoRun {
 	std::vector<int> keyAt;      // frame indices whose output was a key AU
 
 	int aus, keys, maxAu, sendFails, oversized;
+	// X kind 9 retransmit requests received from the guest, and how many the
+	// history could actually answer (an old frame may already be pruned).
+	int rnrReceived, resendHit, resendMiss;
 	int captured, missedCapture, refed; // capture mode: real frames used, ticks without one, duplicates re-fed
 	uint64 auBytes;
 
 	VideoRun() : sendRoom(false), transport(nullptr), vFrameId(1), haveLastFrame(false),
 		aus(0), keys(0), maxAu(0), sendFails(0), oversized(0),
+		rnrReceived(0), resendHit(0), resendMiss(0),
 		captured(0), missedCapture(0), refed(0), auBytes(0) {}
 };
 
@@ -483,8 +488,33 @@ void videoAu(void *ctx, const byte *au, int len, uint32 flags, int64 ptsUs) {
 	}
 }
 
-void reportVideoRun(VideoRun *r, int framesFed) {
-	if (r->latUs.empty()) {
+// X kind 9: a retransmit request from the guest. Payload: [9][target u16le]
+// [count][frameId u32le x count] - self-describing rather than a new wire
+// verb, because the relay treats X bodies as opaque (the guide's catalogue
+// grows, the protocol does not). The target is the all-marker: whichever
+// participant holds the history answers.
+bool handleRetransmitRequest(VideoRun *r, const Transport::Event &event) {
+	if (event.header.type != 'X' || event.payloadLen < 4 || event.payload[0] != 9)
+		return false;
+	if (!(event.payload[1] == 0xFF && event.payload[2] == 0xFF))
+		return false;
+	const int count = event.payload[3];
+	if (count < 1 || count > 8 || event.payloadLen < 4 + 4 * count)
+		return false;
+	++r->rnrReceived;
+	for (int i = 0; i < count; ++i) {
+		const byte *p = event.payload + 4 + 4 * i;
+		const uint32 frameId = (uint32)p[0] | ((uint32)p[1] << 8)
+			| ((uint32)p[2] << 16) | ((uint32)p[3] << 24);
+		if (r->transport && r->transport->resendMedia(frameId))
+			++r->resendHit;
+		else
+			++r->resendMiss;
+	}
+	return true;
+}
+
+void reportVideoRun(VideoRun *r, int framesFed) {	if (r->latUs.empty()) {
 		warning("coop selftest: the encoder produced no output for %d submitted frames", framesFed);
 		return;
 	}
@@ -522,6 +552,9 @@ void reportVideoRun(VideoRun *r, int framesFed) {
 		if (r->sendFails)
 			warning("coop selftest: the transport refused %d encoded frames - role, key, or size",
 				r->sendFails);
+		debug("coop selftest: host retransmit: %d X-kind-9 requests received, %d frames re-sent "
+				"from history, %d requests past the history window",
+			r->rnrReceived, r->resendHit, r->resendMiss);
 	}
 }
 
@@ -575,6 +608,14 @@ void benchEncoder(int seconds) {
 // thread has no render context - and saying so keeps the decode number honest
 // about what it proves.
 
+// Retransmit-request policy: request pacing, a grace window for frames that
+// may still be arriving (reordering), an age bound past which the host's
+// send history has almost certainly pruned the frame, and a per-request cap.
+const int kRnrIntervalMs = 250;
+const int kRnrGraceMs = 80;
+const int kRnrMaxAgeMs = 1500;
+const int kRnrMaxPerRequest = 8;
+
 struct DecodeRun {
 	VideoDecoder dec;
 	Wire::FrameReassembler reassembler;
@@ -584,8 +625,29 @@ struct DecodeRun {
 	std::map<uint32, int64> completeAt;
 	std::vector<int64> latUs;
 	int vFragments, completeAUs, badHeaders, pushFails;
+	// Arrival observations: reordering can produce temporary forward gaps
+	// and nonzero first fragment indices. Neither alone proves packet loss.
+	uint32 maxFrameId;
+	uint32 lastFrameId;
+	int frameGaps;     // frameIds skipped entirely (whole frames lost)
+	int partialFrames; // frames whose first arrival was not fragment 0 (fragments lost)
+	std::set<uint32> framesSeen;
+	uint32 lastCompleteId = 0;
+	bool waitingForIdr = true;
+	int recoveryWaits = 0, recoverySkipped = 0, idrResumes = 0;
 
-	DecodeRun() : vFragments(0), completeAUs(0), badHeaders(0), pushFails(0) {}
+	// frameId -> first moment it was known missing (a higher id arrived). The
+	// guest asks the host to re-send these (X kind 9). Whole frames, not
+	// fragments: a partial video frame is worthless by construction, so its
+	// full value is in its last fragment and selective requests would cost
+	// more than they save.
+	std::map<uint32, int64> missingSince;
+	int rnrSent, rnrEntries;
+	int64 nextRnrMs;
+
+	DecodeRun() : vFragments(0), completeAUs(0), badHeaders(0), pushFails(0),
+		maxFrameId(0), lastFrameId(0), frameGaps(0), partialFrames(0),
+		rnrSent(0), rnrEntries(0), nextRnrMs(0) {}
 };
 
 void decodeCb(void *ctx, const byte *plane, int len, int64 ptsUs) {
@@ -606,6 +668,17 @@ void decodeCb(void *ctx, const byte *plane, int len, int64 ptsUs) {
 			r->dec.stride(), r->dec.sliceHeight());
 }
 
+// MediaCodec's AVC output is Annex B (SPS/PPS are prepended to key AUs).
+// Inspect NAL headers, not codec flags which are not carried on the wire.
+bool containsIdr(const byte *data, int len) {
+	for (int i = 0; i + 3 < len; ++i) {
+		if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1
+				&& (data[i + 3] & 0x1f) == 5)
+			return true;
+	}
+	return false;
+}
+
 void feedVideoFragment(DecodeRun *r, const Transport::Event &event) {
 	if (event.payloadLen <= Wire::kFragHeaderBytes) {
 		++r->badHeaders;
@@ -618,6 +691,22 @@ void feedVideoFragment(DecodeRun *r, const Transport::Event &event) {
 		return;
 	}
 	++r->vFragments;
+	if (frameId > r->maxFrameId)
+		r->maxFrameId = frameId;
+	// Count arrival-order discontinuities, which can include reordering.
+	if (!r->framesSeen.empty() && r->framesSeen.count(frameId) == 0 && frameId > r->lastFrameId + 1) {
+		r->frameGaps += (int)(frameId - r->lastFrameId - 1);
+		// Those skipped ids are what the retransmit requests are for.
+		for (uint32 m = r->lastFrameId + 1; m < frameId; ++m)
+			if (!r->framesSeen.count(m))
+				r->missingSince[m] = nowMs();
+	}
+	if (r->framesSeen.count(frameId))
+		r->missingSince.erase(frameId);
+	if (r->framesSeen.insert(frameId).second && index != 0)
+		++r->partialFrames;
+	if (frameId > r->lastFrameId)
+		r->lastFrameId = frameId;
 
 	Wire::FrameReassembler::Complete done;
 	if (!r->reassembler.feed(frameId, index, count,
@@ -626,8 +715,31 @@ void feedVideoFragment(DecodeRun *r, const Transport::Event &event) {
 		return;
 
 	++r->completeAUs;
+	// No B-frames in this stream: never feed a late AU behind a newer one.
+	// A gap means reference continuity is no longer known, even if the
+	// missing AU eventually arrives. Resume only at an independent picture.
+	if (r->lastCompleteId && done.frameId <= r->lastCompleteId) {
+		++r->recoverySkipped;
+		return;
+	}
+	if (r->lastCompleteId && done.frameId != r->lastCompleteId + 1 && !r->waitingForIdr) {
+		r->waitingForIdr = true;
+		++r->recoveryWaits;
+	}
+	r->lastCompleteId = done.frameId;
+	if (r->waitingForIdr) {
+		if (!containsIdr(done.data, done.len)) {
+			++r->recoverySkipped;
+			return;
+		}
+		r->waitingForIdr = false;
+		++r->idrResumes;
+	}
 	r->completeAt[done.frameId] = nowUs();
 	if (!r->dec.push(done.data, (int)done.len, (int64)done.frameId, decodeCb, r)) {
+		r->completeAt.erase(done.frameId);
+		r->waitingForIdr = true;
+		++r->recoveryWaits;
 		++r->pushFails;
 		if (r->pushFails == 1)
 			warning("coop selftest: the decoder refused AU %u - video stops being measured, "
@@ -635,7 +747,62 @@ void feedVideoFragment(DecodeRun *r, const Transport::Event &event) {
 	}
 }
 
+// Ask the host, at most every kRnrIntervalMs, for whole frames that never
+// arrived. Whole frames rather than fragments: a partial video frame is
+// worthless by construction (the reassembler drops it), so its full value is
+// in its last fragment and a per-fragment protocol would cost more than it
+// saves at these loss rates. The grace window keeps this from double-
+// requesting frames that are merely reordered, and the age bound stops asking
+// once the host's send history has almost certainly dropped them.
+void flushRetransmitRequests(DecodeRun *r, Transport *transport) {
+	if (!transport || !transport->isOpen() || r->missingSince.empty())
+		return;
+	const int64 now = nowMs();
+	if (now < r->nextRnrMs)
+		return;
+	r->nextRnrMs = now + kRnrIntervalMs;
+
+	byte req[4 + 4 * kRnrMaxPerRequest];
+	req[0] = 9;	// kind: retransmit request (the client guide's catalogue)
+	req[1] = 0xFF;
+	req[2] = 0xFF;
+	int n = 0;
+	std::map<uint32, int64>::iterator it = r->missingSince.begin();
+	while (it != r->missingSince.end()) {
+		const int64 age = now - it->second;
+		if (age > kRnrMaxAgeMs) {
+			// Past the history window: asking again cannot help. The
+			// recovery guard already covered the picture consequence.
+			r->missingSince.erase(it++);
+			continue;
+		}
+		if (age >= kRnrGraceMs && n < kRnrMaxPerRequest) {
+			const uint32 id = it->first;
+			req[4 + 4 * n] = (byte)(id & 0xff);
+			req[5 + 4 * n] = (byte)((id >> 8) & 0xff);
+			req[6 + 4 * n] = (byte)((id >> 16) & 0xff);
+			req[7 + 4 * n] = (byte)((id >> 24) & 0xff);
+			++n;
+		}
+		++it;
+	}
+	if (!n)
+		return;
+	req[3] = (byte)n;
+	if (transport->sendFrame('X', req, 4 + 4 * n)) {
+		++r->rnrSent;
+		r->rnrEntries += n;
+	}
+}
+
 void reportDecodeRun(DecodeRun *r, int seconds) {
+	debug("coop selftest: guest retransmit: %d X-kind-9 requests sent, %d frame requests in them",
+		r->rnrSent, r->rnrEntries);
+	debug("coop selftest: guest recovery: %d reference discontinuities, %d AUs skipped, %d IDR resumes",
+		r->recoveryWaits, r->recoverySkipped, r->idrResumes);
+	debug("coop selftest: guest video arrivals: frameIds through %u, %d AUs complete, "
+			"%d forward-gap IDs (may reorder), %d frames first seen at nonzero fragment index",
+			r->maxFrameId, r->completeAUs, r->frameGaps, r->partialFrames);
 	if (r->completeAUs == 0) {
 		warning("coop selftest: received %u V fragments but reassembled no complete AU - "
 				"was a video host present, and did it start before this guest?",
@@ -805,6 +972,9 @@ void runTestBody(const Config &cfg) {
 		} else {
 			video.sendRoom = true;
 			video.transport = &transport;
+			// Answer the guest's retransmit requests (X kind 9): keep sent AUs
+			// for a short window so a named missing frame can be re-sent.
+			transport.enableMediaHistory();
 			videoOn = true;
 			if (cfg.capture) {
 				// Real pixels from the §6 path instead of the synthetic
@@ -864,6 +1034,9 @@ void runTestBody(const Config &cfg) {
 				// bury every other line. The DecodeRun counters are the report.
 				if (event.header.type == 'V' && decode.dec.isOpen()) {
 					feedVideoFragment(&decode, event);
+				} else if (video.sendRoom && handleRetransmitRequest(&video, event)) {
+					// A retransmit the host answered (counted, not logged:
+					// an RNR burst is a dozen datagrams a second at worst).
 				} else {
 					debug("coop selftest: frame '%c' from peer %u, %d bytes, envelope 0x%02x",
 						event.header.type, event.header.peerId, event.payloadLen, event.envelope);
@@ -911,6 +1084,11 @@ void runTestBody(const Config &cfg) {
 			}
 			nextSend += 1000;
 		}
+
+		// Guest video: ask for what never arrived (self-paced to
+		// kRnrIntervalMs inside).
+		if (decode.dec.isOpen())
+			flushRetransmitRequests(&decode, &transport);
 
 		if (videoOn && nowMs() >= videoNextMs) {
 			// Real pacing: the frame timer, not the loop tick. Drift is
