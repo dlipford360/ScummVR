@@ -609,6 +609,12 @@ static bool updateCoopVideo(VRApp *a) {
 	glBindTexture(GL_TEXTURE_2D, a->videoTexY);
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, frame.width, frame.height, 0,
 		GL_RED, GL_UNSIGNED_BYTE, frame.frame.data());
+	// Units matter for the chroma plane: UNPACK_ROW_LENGTH counts texels, and
+	// an NV12 UV row of `stride` BYTES is stride/2 GL_RG8 texels. Reusing the
+	// Y value here made every UV row skip twice as far - the first runs showed
+	// crisp luma with chroma from the wrong bytes, which the wearer described
+	// as "a double image of colors and black and white" (2026-10-23).
+	glPixelStorei(GL_UNPACK_ROW_LENGTH, frame.stride / 2);
 	glBindTexture(GL_TEXTURE_2D, a->videoTexUV);
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, frame.width / 2, frame.height / 2, 0,
 		GL_RG, GL_UNSIGNED_BYTE, frame.frame.data() + (size_t)frame.stride * frame.sliceHeight);
