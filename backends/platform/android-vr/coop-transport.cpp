@@ -61,7 +61,9 @@ Transport::Transport()
 	  _badPackets(0),
 	  _cryptoDrops(0),
 	  _datagramsIn(0),
-	  _hellosSent(0) {
+	  _hellosSent(0),
+	  _mediaHistory(false),
+	  _historyBytes(0) {
 	_code[0] = 0;
 	_secret[0] = 0;
 	_status[0] = 0;
@@ -113,6 +115,20 @@ bool Transport::open(const char *host, int port) {
 		const int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
 		if (fd < 0)
 			continue;
+		// Request burst tolerance before traffic starts. Real H.264 keyframes
+		// can span ~135 datagrams. The OS may clamp these requests; report the
+		// effective sizes rather than assuming the requested capacity.
+		int opt = 4 << 20;
+		setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &opt, sizeof(opt));
+		opt = 2 << 20;
+		setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &opt, sizeof(opt));
+		int recvBytes = 0, sendBytes = 0;
+		socklen_t optLen = sizeof(int);
+		getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &recvBytes, &optLen);
+		optLen = sizeof(int);
+		getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sendBytes, &optLen);
+		debug("coop: effective socket buffers receive=%d send=%d bytes, event queue=%d",
+			recvBytes, sendBytes, kQueueDepth);
 		// Connected rather than unbound: HELLO carries the session secret, and a
 		// connected socket means only the relay can feed this parser.
 		if (connect(fd, ai->ai_addr, ai->ai_addrlen) != 0) {
@@ -193,6 +209,11 @@ void Transport::close() {
 	std::lock_guard<std::mutex> lock(_queueMutex);
 	_queueHead = 0;
 	_queueCount = 0;
+
+	{
+		std::lock_guard<std::mutex> historyLock(_historyMutex);
+		_history.clear();
+	}
 }
 
 bool Transport::isOpen() const {
@@ -348,7 +369,44 @@ bool Transport::sendMedia(char type, uint32 frameId, const byte *data, int dataL
 	if (count < 1 || count > Wire::FrameReassembler::kMaxFragments)
 		return false;
 
+	// Whole-AU serialization: the pacing below releases _sendMutex between
+	// fragments on purpose, so without this a resend from the room thread could
+	// weave its fragments into a live frame's burst. The pacing sleeps here,
+	// not under any socket lock.
+	std::lock_guard<std::mutex> mediaLock(_mediaSendMutex);
+
+	// Keep the AU while it can still be worth resending. Recorded before the
+	// first fragment goes out: a partial send is still a frame the receiver
+	// will ask for. Prune by age and total bytes (see kHistory* in the header).
+	if (_mediaHistory && type == 'V') {
+		const int64 nowMs = monotonicMs();
+		std::lock_guard<std::mutex> historyLock(_historyMutex);
+		while (!_history.empty()
+				&& (nowMs - _history.front().sentMs > kHistoryMaxAgeMs
+					|| _historyBytes > kHistoryMaxBytes - (size_t)dataLen)) {
+			_historyBytes -= (int)_history.front().data.size();
+			_history.pop_front();
+		}
+		if (dataLen <= kHistoryMaxBytes) {
+			MediaHistoryEntry entry;
+			entry.frameId = frameId;
+			entry.sentMs = nowMs;
+			entry.data.assign(data, data + dataLen);
+			_historyBytes += dataLen;
+			_history.push_back(std::move(entry));
+		}
+	}
+
+	// Spread a video AU over the link instead of bursting a whole IDR into
+	// the relay/guest socket at once. 250 us between fragments spreads a
+	// measured 135-fragment IDR over at least 33.5 ms. This is a send-rate
+	// ceiling, not congestion control. Audio/control use their existing path.
+	// Base each deadline on actual completion so scheduler stalls cannot
+	// produce a catch-up burst. Never sleep while holding _sendMutex.
+	auto nextFragment = std::chrono::steady_clock::now();
 	for (int index = 0; index < count; ++index) {
+		if (type == 'V' && index > 0)
+			std::this_thread::sleep_until(nextFragment);
 		const int offset = index * Wire::kMaxFragmentBytes;
 		int chunk = dataLen - offset;
 		if (chunk > Wire::kMaxFragmentBytes)
@@ -369,8 +427,36 @@ bool Transport::sendMedia(char type, uint32 frameId, const byte *data, int dataL
 		// (type, peerId, SEQ), so it must differ per fragment.
 		if (!sendEnclosed(type, plain, plainLen))
 			return false;
+		nextFragment = std::chrono::steady_clock::now() + std::chrono::microseconds(250);
 	}
 	return true;
+}
+
+bool Transport::enableMediaHistory() {
+	_mediaHistory = true;
+	return true;
+}
+
+bool Transport::resendMedia(uint32 frameId) {
+	std::vector<byte> au;
+	{
+		std::lock_guard<std::mutex> lock(_historyMutex);
+		// Newest match wins: a frame that was itself resent appears once more,
+		// and the newest copy is the one still inside the age window.
+		for (std::deque<MediaHistoryEntry>::reverse_iterator it = _history.rbegin();
+				it != _history.rend(); ++it) {
+			if (it->frameId == frameId) {
+				au = it->data;
+				break;
+			}
+		}
+	}
+	if (au.empty())
+		return false;
+	// Re-sent under the same frameId: fragments are idempotent at the
+	// reassembler, so a receiver that lost only some of them just completes
+	// the frame, and one that lost all of them gets a second chance.
+	return sendMedia('V', frameId, au.data(), (int)au.size());
 }
 
 bool Transport::sendEnclosed(char type, const byte *plain, int plainLen) {

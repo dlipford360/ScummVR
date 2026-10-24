@@ -41,8 +41,10 @@
 #include "backends/platform/android-vr/coop-wire.h"
 
 #include <atomic>
+#include <deque>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace Coop {
 
@@ -133,6 +135,16 @@ public:
 	// fragment header, each fragment sealed-and-enveloped separately.
 	bool sendMedia(char type, uint32 frameId, const byte *data, int dataLen);
 
+	// Retransmit support. A receiver that detects a missing 'V' frame asks for it
+	// by frameId (the X kind 9 request in the client guide); the sender can only
+	// answer if it still has the AU, so a host that wants to answer requests
+	// enables this first: sendMedia then keeps each AU for a short window, and
+	// resendMedia re-sends the stored bytes under the same frameId. The other
+	// end's reassembler ignores duplicate fragments, so a frame that was only
+	// partially lost simply completes.
+	bool enableMediaHistory();
+	bool resendMedia(uint32 frameId);
+
 	// Non-blocking. Returns false when the queue is empty.
 	bool pollEvent(Event *out);
 
@@ -159,7 +171,10 @@ public:
 	uint32 hellosSent() const { return _hellosSent; }
 
 private:
-	static const int kQueueDepth = 64;
+	// Absorb two maximum-size media frames while the consumer services the
+	// decoder, plus room for control traffic. This is burst capacity, not a
+	// playout delay; the consumer drains it immediately.
+	static const int kQueueDepth = 2 * Wire::FrameReassembler::kMaxFragments + 32;
 
 	void receiveLoop();
 	void handleDatagram(const byte *packet, int len);
@@ -206,6 +221,27 @@ private:
 
 	mutable std::mutex _sendMutex; // credentials, SEQ counters, and socket writes
 	Wire::SeqCounter _seq;
+
+	// Media sends are serialized whole-AU: the pacing in sendMedia releases
+	// _sendMutex between fragments, and a retransmit from the room thread must
+	// not interleave its fragments into a live frame's burst. One counter
+	// ('V') namespace, and SEQ stays monotonic per frame type either way.
+	std::mutex _mediaSendMutex;
+
+	// Retransmit window: recent AUs kept for resendMedia. Sized in bytes and
+	// age, not frame count: at the 4 Mbit/s cap 1 MB is ~2 s of video, which
+	// covers the RTT plus the guest's detection delay with room to spare.
+	static const int kHistoryMaxBytes = 1024 * 1024;
+	static const int64 kHistoryMaxAgeMs = 2000;
+	struct MediaHistoryEntry {
+		uint32 frameId;
+		int64 sentMs;
+		std::vector<byte> data;
+	};
+	bool _mediaHistory;
+	int _historyBytes;
+	std::mutex _historyMutex;
+	std::deque<MediaHistoryEntry> _history;
 
 	mutable std::mutex _stateMutex;
 	char _status[Wire::kMaxHeaderBytes + 1];
