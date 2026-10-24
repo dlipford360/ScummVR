@@ -622,6 +622,9 @@ static bool updateCoopVideo(VRApp *a) {
 	glBindTexture(GL_TEXTURE_2D, 0);
 
 	a->videoLastSeq = frame.seq;
+	if (frame.frameId % Coop::kCoopLatSampleEvery == 0 && Coop::g_coopClockSynced)
+		LOGI("coop selftest: lat guest id %u uploaded %lld", frame.frameId,
+			(long long)(stats.uploadWallUs + Coop::g_coopClockOffsetUs));
 	LOGD("coop video: frame %u (%dx%d, stride %d slice %d) uploaded, decode-to-upload %lld us",
 		frame.seq, frame.width, frame.height, frame.stride, frame.sliceHeight,
 		(long long)stats.decodeToUploadUs);

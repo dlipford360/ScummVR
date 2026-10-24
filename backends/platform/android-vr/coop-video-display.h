@@ -50,12 +50,14 @@ struct VideoRenderStats {
 	int decodedTo;         // frames decoded while the display was wanted
 	int64 decodeToUploadUs; // us from this frame's decode callback to upload
 	int64 uploadWallUs;     // steady_clock now() at the upload
+	uint32 uploadFrameId;   // the wire frameId that was just uploaded
 };
 
 struct VideoMailbox {
 	std::mutex m;
 	std::vector<byte> frame; // NV12, laid out per stride/sliceHeight below
 	uint32 seq;
+	uint32 frameId;          // the wire frameId of the frame in the slot
 	int64 publishedAtUs;     // steady_clock now() at the decode callback
 	// What the codec actually published for the frame in the slot.
 	int width, height, stride, sliceHeight;
@@ -75,10 +77,22 @@ extern VideoMailbox g_coopVideo;
 // reads it, and a torn read just skips or shows one frame.
 extern volatile bool g_coopVideoDisplayWant;
 
+// End-to-end latency sampling: the decode side, the render side, and the
+// host side all timestamp the same wire frameIds, and the samples join
+// offline by id. One line per kCoopLatSampleEvery frames keeps the log
+// itself out of the measurement.
+const uint32 kCoopLatSampleEvery = 15;
+
+// The self-test thread keeps these current from Transport's PONG-derived
+// clock estimate, so the render thread can timestamp an upload in the
+// relay's clock - the one clock both headsets share.
+extern volatile bool g_coopClockSynced;
+extern volatile int64 g_coopClockOffsetUs; // add to a local steady-clock us
+
 // Producer side (decode callback thread). Copies the codec's NV12 output into
 // the mailbox; layout values are the codec's published stride/sliceHeight.
 void publishVideoFrame(const byte *plane, int len, int64 decodedAtUs,
-	int width, int height, int stride, int sliceHeight);
+	int width, int height, int stride, int sliceHeight, uint32 frameId);
 
 // Consumer side (VR render thread). Returns true and fills a copy of the
 // slot if it holds a frame newer than lastSeq, which is updated to the

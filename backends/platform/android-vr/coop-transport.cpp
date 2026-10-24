@@ -62,6 +62,8 @@ Transport::Transport()
 	  _cryptoDrops(0),
 	  _datagramsIn(0),
 	  _hellosSent(0),
+	  _clockSamples(0),
+	  _pingSentMonoUs(0),
 	  _mediaHistory(false),
 	  _historyBytes(0) {
 	_code[0] = 0;
@@ -76,6 +78,34 @@ Transport::~Transport() {
 int64 Transport::monotonicMs() {
 	return (int64)std::chrono::duration_cast<std::chrono::milliseconds>(
 		std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// "PONG <CODE> <PEERID> <epoch_ms>" (protocol.ts): the stamp is the fourth
+// token and is the relay's own wall clock, which is exactly what makes two
+// headsets comparable. Manual parse - the line is ours, and a PONG without a
+// sane stamp is simply no sample.
+static int64 parsePongStampUs(const char *text) {
+	int skips = 0;
+	const char *p = text;
+	while (*p && skips < 3) {
+		while (*p == ' ')
+			++p;
+		while (*p && *p != ' ')
+			++p;
+		++skips;
+	}
+	while (*p == ' ')
+		++p;
+	int64 ms = 0;
+	int digits = 0;
+	while (*p >= '0' && *p <= '9') {
+		ms = ms * 10 + (*p - '0');
+		++p;
+		++digits;
+	}
+	if (digits < 10 || digits > 14) // a millisecond epoch, not a counter
+		return -1;
+	return ms * 1000;
 }
 
 bool Transport::open(const char *host, int port) {
@@ -437,6 +467,52 @@ bool Transport::enableMediaHistory() {
 	return true;
 }
 
+int64 Transport::monotonicUs() {
+	return std::chrono::duration_cast<std::chrono::microseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void Transport::noteClockSample(int64 relayEpochUs, int64 sentMonoUs, int64 recvMonoUs) {
+	const int64 rttUs = recvMonoUs - sentMonoUs;
+	if (rttUs < 0 || rttUs > 5 * 1000 * 1000)
+		return; // nonsense or a stall: the median protects the estimate, but
+				// a minute-long gap would skew the error bar for no reason.
+	std::lock_guard<std::mutex> lock(_clockMutex);
+	const int slot = _clockSamples % kClockWindow;
+	_clockOffsets[slot] = relayEpochUs - (sentMonoUs + rttUs / 2);
+	_clockHalves[slot] = rttUs / 2;
+	++_clockSamples;
+}
+
+int64 Transport::clockEpochOffsetUs() const {
+	std::lock_guard<std::mutex> lock(_clockMutex);
+	const int total = _clockSamples.load();
+	if (total < kClockMinSamples)
+		return 0;
+	int n = total < kClockWindow ? total : kClockWindow;
+	int64 sorted[kClockWindow];
+	for (int i = 0; i < n; ++i)
+		sorted[i] = _clockOffsets[i];
+	for (int i = 1; i < n; ++i) // small n: insertion sort, no <algorithm> here
+		for (int j = i; j > 0 && sorted[j - 1] > sorted[j]; --j) {
+			const int64 t = sorted[j - 1];
+			sorted[j - 1] = sorted[j];
+			sorted[j] = t;
+		}
+	return sorted[n / 2];
+}
+
+int64 Transport::clockUncertaintyUs() const {
+	std::lock_guard<std::mutex> lock(_clockMutex);
+	const int total = _clockSamples.load();
+	int n = total < kClockWindow ? total : kClockWindow;
+	int64 worst = 0;
+	for (int i = 0; i < n; ++i)
+		if (_clockHalves[i] > worst)
+			worst = _clockHalves[i];
+	return worst;
+}
+
 bool Transport::resendMedia(uint32 frameId) {
 	std::vector<byte> au;
 	{
@@ -604,6 +680,11 @@ void Transport::handleDatagram(const byte *packet, int len) {
 			_lastPongMs = monotonicMs();
 		} else if (startsWithWord(received.text, "PONG")) {
 			_lastPongMs = monotonicMs();
+			if (_pingSentMonoUs) {
+				const int64 stampUs = parsePongStampUs(received.text);
+				if (stampUs > 0)
+					noteClockSample(stampUs, _pingSentMonoUs, monotonicUs());
+			}
 		} else if (startsWithWord(received.text, "CLOSED") || startsWithWord(received.text, "KICKED")) {
 			_closed = true;
 			_ready = false;
@@ -740,6 +821,9 @@ void Transport::receiveLoop() {
 						debug("coop: HELLO written for room %s as peer %u, %d bytes", _code, (unsigned)_peerId, len);
 				}
 			} else {
+				// Keep the departure time: the PONG's relay stamp turns the
+				// pair into a clock offset (see noteClockSample).
+				_pingSentMonoUs = monotonicUs();
 				sendTextFrame(line, len);
 			}
 		}

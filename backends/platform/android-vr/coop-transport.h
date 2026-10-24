@@ -155,6 +155,19 @@ public:
 	// Last control line seen, for reporting: DENY reasons, CLOSED, KICKED.
 	void statusText(char *out, int capacity) const;
 
+	// Relay-clock synchronisation, measured from the keepalive it already does:
+	// the PONG carries the relay's wall clock (protocol.ts), so a PING/PONG
+	// exchange yields offset = relayEpoch - (t1 + RTT/2). The median of the
+	// recent samples converts this instance's monotonic clock to the relay's -
+	// which is how two headsets' timestamps become comparable without either
+	// trusting its own wall clock.
+	bool clockSynced() const { return _clockSamples >= kClockMinSamples; }
+	int64 clockEpochOffsetUs() const;
+
+	// Largest observed RTT/2 across the kept samples: the honest error bar on
+	// every offset-derived comparison.
+	int64 clockUncertaintyUs() const;
+
 	uint32 droppedEvents() const { return _droppedEvents; }
 	uint32 badPackets() const { return _badPackets; }
 	// Inbound frames this transport could not authenticate: wrong key, rewritten
@@ -192,6 +205,11 @@ private:
 
 	void noteStatus(const char *text);
 	static int64 monotonicMs();
+	static int64 monotonicUs();
+
+	// Feed one PONG's relay stamp into the clock estimator. `sentMonoUs` is
+	// when the matching PING left, `recvMonoUs` when the PONG arrived.
+	void noteClockSample(int64 relayEpochUs, int64 sentMonoUs, int64 recvMonoUs);
 
 	int _fd;
 	std::thread _thread;
@@ -221,6 +239,18 @@ private:
 
 	mutable std::mutex _sendMutex; // credentials, SEQ counters, and socket writes
 	Wire::SeqCounter _seq;
+
+	// PING/PONG-derived relay clock offset (see clockEpochOffsetUs). Samples
+	// are kept on the receive thread that produces them; readers take a
+	// median of the small window, so a single spike on either leg cannot move
+	// the reported offset.
+	static const int kClockWindow = 8;
+	static const int kClockMinSamples = 3;
+	mutable std::mutex _clockMutex; // estimator is written by the receive thread, read by const getters
+	int64 _clockOffsets[kClockWindow];
+	int64 _clockHalves[kClockWindow]; // RTT/2 per sample, for the error bar
+	std::atomic<int> _clockSamples; // total ever produced; window is ring-filled
+	int64 _pingSentMonoUs;
 
 	// Media sends are serialized whole-AU: the pacing in sendMedia releases
 	// _sendMutex between fragments, and a retransmit from the room thread must

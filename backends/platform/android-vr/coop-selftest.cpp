@@ -272,6 +272,7 @@ struct VideoRun {
 	std::vector<byte> rgba;     // capture mode: the newest readback, pre-conversion
 	bool haveLastFrame;         // capture mode: frame holds the last real pixels
 	std::vector<int64> submitAt; // frame index -> monotonic us at hand-off
+	std::vector<int64> captureAtUs; // frame index -> when those pixels left the GPU (carried for re-feeds)
 	std::vector<int64> latUs;    // completed AUs: submit -> callback latency
 	std::vector<int> keyAt;      // frame indices whose output was a key AU
 
@@ -483,8 +484,20 @@ void videoAu(void *ctx, const byte *au, int len, uint32 flags, int64 ptsUs) {
 			++r->oversized;
 			return;
 		}
-		if (!r->transport->sendMedia('V', r->vFrameId++, au, len))
+		if (!r->transport->sendMedia('V', r->vFrameId, au, len)) {
 			++r->sendFails;
+		} else if (r->vFrameId % kCoopLatSampleEvery == 0 && r->transport->clockSynced()) {
+			// Latency sample, host end: when these pixels left the GPU and
+			// when the last fragment left the socket, in the relay's clock -
+			// the guest stamps the same frameId, and the two join offline.
+			const int64 off = r->transport->clockEpochOffsetUs();
+			int64 capEpoch = 0;
+			if (frameIdx >= 0 && frameIdx < (int)r->captureAtUs.size() && r->captureAtUs[frameIdx])
+				capEpoch = r->captureAtUs[frameIdx] + off;
+			debug("coop selftest: lat host id %u captured %lld sent %lld",
+				r->vFrameId, (long long)capEpoch, (long long)(nowUs() + off));
+		}
+		++r->vFrameId;
 	}
 }
 
@@ -624,6 +637,7 @@ struct DecodeRun {
 	// the wire frameId, which both ends agree exists.
 	std::map<uint32, int64> completeAt;
 	std::vector<int64> latUs;
+	Transport *transport; // for the clock estimate behind latency samples
 	int vFragments, completeAUs, badHeaders, pushFails;
 	// Arrival observations: reordering can produce temporary forward gaps
 	// and nonzero first fragment indices. Neither alone proves packet loss.
@@ -645,7 +659,7 @@ struct DecodeRun {
 	int rnrSent, rnrEntries;
 	int64 nextRnrMs;
 
-	DecodeRun() : vFragments(0), completeAUs(0), badHeaders(0), pushFails(0),
+	DecodeRun() : transport(nullptr), vFragments(0), completeAUs(0), badHeaders(0), pushFails(0),
 		maxFrameId(0), lastFrameId(0), frameGaps(0), partialFrames(0),
 		rnrSent(0), rnrEntries(0), nextRnrMs(0) {}
 };
@@ -657,6 +671,14 @@ void decodeCb(void *ctx, const byte *plane, int len, int64 ptsUs) {
 	std::map<uint32, int64>::iterator at = r->completeAt.find((uint32)ptsUs);
 	if (at != r->completeAt.end()) {
 		r->latUs.push_back(nowUs() - at->second);
+		if ((uint32)ptsUs % kCoopLatSampleEvery == 0 && r->transport && r->transport->clockSynced()) {
+			// Latency sample, guest decode hop: arrival and decode in the
+			// relay's clock. The render hop stamps the same id from the VR
+			// thread; the host stamped its two ends. The join is offline.
+			const int64 off = r->transport->clockEpochOffsetUs();
+			debug("coop selftest: lat guest id %u received %lld decoded %lld",
+				(uint32)ptsUs, (long long)(at->second + off), (long long)(nowUs() + off));
+		}
 		r->completeAt.erase(at);
 	}
 	// Touch the buffer so the callback is not optimizable to nothing, and
@@ -665,7 +687,7 @@ void decodeCb(void *ctx, const byte *plane, int len, int64 ptsUs) {
 	// the layout values are the codec's published ones, deliberately.
 	if (len > 0)
 		publishVideoFrame(plane, len, nowUs(), r->dec.width(), r->dec.height(),
-			r->dec.stride(), r->dec.sliceHeight());
+			r->dec.stride(), r->dec.sliceHeight(), (uint32)ptsUs);
 }
 
 // MediaCodec's AVC output is Annex B (SPS/PPS are prepended to key AUs).
@@ -1002,6 +1024,7 @@ void runTestBody(const Config &cfg) {
 		} else if (!decode.dec.open(kVideoWidth, kVideoHeight)) {
 			warning("coop selftest: no usable H.264 decoder on this device");
 		} else {
+			decode.transport = &transport;
 			debug("coop selftest: decoder open for %d x %d, waiting for the room's video host",
 				kVideoWidth, kVideoHeight);
 			if (cfg.display) {
@@ -1014,12 +1037,14 @@ void runTestBody(const Config &cfg) {
 	const int64 videoStartMs = nowMs();
 	int videoFramesFed = 0;
 	int64 videoNextMs = videoStartMs;
+	int64 lastContentCapUs = 0; // capture time of the newest real pixels, carried across re-feeds
 
 	// Stay joined, send one application frame a second, and report everything the
 	// relay sends back. With two headsets this is where a sealed frame crossing a
 	// real relay in both directions gets proven.
 	uint32 framesIn = 0, dataIn = 0, rosterIn = 0, controlIn = 0;
 	int appSeq = 0;
+	int clockStatusEvery = 0;
 	int mediaProbes = 0;
 	int64 nextSend = nowMs();
 	const int64 until = nowMs() + (int64)cfg.seconds * 1000;
@@ -1083,6 +1108,17 @@ void runTestBody(const Config &cfg) {
 				++mediaProbes;
 			}
 			nextSend += 1000;
+
+			// Keep the shared clock current for the render thread's latency
+			// samples, and state the estimate's own error bar periodically:
+			// every lat line is only comparable up to that number.
+			if (transport.clockSynced()) {
+				g_coopClockOffsetUs = transport.clockEpochOffsetUs();
+				g_coopClockSynced = true;
+				if (++clockStatusEvery % 30 == 1)
+					debug("coop selftest: clock: relay offset %lld us, half-RTT worst %lld us",
+						(long long)g_coopClockOffsetUs, (long long)transport.clockUncertaintyUs());
+			}
 		}
 
 		// Guest video: ask for what never arrived (self-paced to
@@ -1130,7 +1166,10 @@ void runTestBody(const Config &cfg) {
 				if (video.haveLastFrame) {
 					if (capAt == 0)
 						++video.refed;
+					else
+						lastContentCapUs = capAt;
 					video.submitAt[videoFramesFed] = nowUs();
+					video.captureAtUs[videoFramesFed] = lastContentCapUs;
 					if (!video.enc.submitFrame(video.frame.data(),
 							(int64)videoFramesFed * 1000000 / kVideoFps, videoAu, &video)) {
 						warning("coop selftest: the encoder failed at frame %d; video stops, the room does not",
@@ -1268,9 +1307,11 @@ void runTest(const Config &cfg) {
 // decoder; the VR thread links against grabVideoFrame.
 VideoMailbox g_coopVideo;
 volatile bool g_coopVideoDisplayWant = false;
+volatile bool g_coopClockSynced = false;
+volatile int64 g_coopClockOffsetUs = 0;
 
 void publishVideoFrame(const byte *plane, int len, int64 decodedAtUs,
-	int width, int height, int stride, int sliceHeight) {
+	int width, int height, int stride, int sliceHeight, uint32 frameId) {
 	if (!g_coopVideoDisplayWant || width <= 0 || height <= 0)
 		return;
 	// NV12 as the codec laid it out: a stride x sliceHeight luma plane plus
@@ -1290,6 +1331,7 @@ void publishVideoFrame(const byte *plane, int len, int64 decodedAtUs,
 	g_coopVideo.height = height;
 	g_coopVideo.stride = stride;
 	g_coopVideo.sliceHeight = sliceHeight;
+	g_coopVideo.frameId = frameId;
 	g_coopVideo.publishedAtUs = decodedAtUs;
 	g_coopVideo.haveNew = true;
 	++g_coopVideo.seq;
@@ -1306,6 +1348,7 @@ bool grabVideoFrame(VideoMailbox *out, uint32 lastSeq, VideoRenderStats *stats) 
 	out->height = g_coopVideo.height;
 	out->stride = g_coopVideo.stride;
 	out->sliceHeight = g_coopVideo.sliceHeight;
+	out->frameId = g_coopVideo.frameId;
 
 	stats->decodedTo = g_coopVideo.stats.decodedTo;
 	++g_coopVideo.stats.rendered;
@@ -1314,6 +1357,7 @@ bool grabVideoFrame(VideoMailbox *out, uint32 lastSeq, VideoRenderStats *stats) 
 		std::chrono::steady_clock::now().time_since_epoch()).count();
 	stats->decodeToUploadUs = now - g_coopVideo.publishedAtUs;
 	stats->uploadWallUs = now;
+	stats->uploadFrameId = g_coopVideo.frameId;
 	g_coopVideo.latUs.push_back(stats->decodeToUploadUs);
 	return true;
 }
