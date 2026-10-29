@@ -47,6 +47,7 @@
 
 // ScummVM headers for event pushing
 #include "common/system.h"
+#include "common/debug.h"
 #include "common/events.h"
 #include "common/config-manager.h"
 #include "backends/platform/android/android.h"
@@ -622,9 +623,13 @@ static bool updateCoopVideo(VRApp *a) {
 	glBindTexture(GL_TEXTURE_2D, 0);
 
 	a->videoLastSeq = frame.seq;
-	if (frame.frameId % Coop::kCoopLatSampleEvery == 0 && Coop::g_coopClockSynced)
-		LOGI("coop selftest: lat guest id %u uploaded %lld", frame.frameId,
+	if (frame.frameId % Coop::kCoopLatSampleEvery == 0 && Coop::g_coopClockSynced) {
+		// Same log channel as the decode-side samples: joined offline by
+		// frameId, so a second channel (logcat) would only lose lines to
+		// buffer wrap. debug() is thread-safe.
+		debug("coop selftest: lat guest id %u uploaded %lld", frame.frameId,
 			(long long)(stats.uploadWallUs + Coop::g_coopClockOffsetUs));
+	}
 	LOGD("coop video: frame %u (%dx%d, stride %d slice %d) uploaded, decode-to-upload %lld us",
 		frame.seq, frame.width, frame.height, frame.stride, frame.sliceHeight,
 		(long long)stats.decodeToUploadUs);

@@ -490,15 +490,22 @@ void videoAu(void *ctx, const byte *au, int len, uint32 flags, int64 ptsUs) {
 		if (!r->transport->sendMedia('V', r->vFrameId, au, len)) {
 			++r->sendFails;
 		} else if (r->vFrameId % kCoopLatSampleEvery == 0 && r->transport->clockSynced()) {
-			// Latency sample, host end: when these pixels left the GPU and
-			// when the last fragment left the socket, in the relay's clock -
-			// the guest stamps the same frameId, and the two join offline.
+			// Latency sample, host end: when these pixels left the GPU, when
+			// they entered the encoder, and when the last fragment left the
+		 // socket, in the relay's clock - the guest stamps the same
+			// frameId, and the two join offline. The submit stamp matters:
+			// re-fed frames carry an older capture time (the game repaints
+			// ~10-12 fps), so captured->sent alone would fold the game's
+			// repaint cadence into the pipeline's cost. captured->submit is
+			// the pixel age; submit->sent is the encode-and-send pipeline.
 			const int64 off = r->transport->clockEpochOffsetUs();
-			int64 capEpoch = 0;
+			int64 capEpoch = 0, submitEpoch = 0;
 			if (frameIdx >= 0 && frameIdx < (int)r->captureAtUs.size() && r->captureAtUs[frameIdx])
 				capEpoch = r->captureAtUs[frameIdx] + off;
-			debug("coop selftest: lat host id %u captured %lld sent %lld",
-				r->vFrameId, (long long)capEpoch, (long long)(nowUs() + off));
+			if (frameIdx >= 0 && frameIdx < (int)r->submitAt.size() && r->submitAt[frameIdx])
+				submitEpoch = r->submitAt[frameIdx] + off;
+			debug("coop selftest: lat host id %u captured %lld submitted %lld sent %lld",
+				r->vFrameId, (long long)capEpoch, (long long)submitEpoch, (long long)(nowUs() + off));
 		}
 		++r->vFrameId;
 	}
