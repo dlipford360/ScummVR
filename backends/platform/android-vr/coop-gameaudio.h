@@ -32,8 +32,10 @@
 // an Audio::AudioStream and started once through Mixer::playStream, so the
 // game audio plays through the same output path any other game stream uses
 // (the mixer rate-converts 48k -> the device's 44.1k; see client guide §9).
-// Gaps are concealed by asking the decoder for PLC frames; a ring that grows
-// past its latency bound drops oldest samples, which is how the two headsets'
+// Loss policy, in order: the sender's inband FEC reconstructs the frame just
+// before a gap exactly, from the packet that proves the gap; frames further
+// back are concealed by PLC; long gaps get silence. A ring that grows past
+// its latency bound drops oldest samples, which is how the two headsets'
 // crystal drift is absorbed without either clock being trusted.
 //
 // Threading contract: the tap callback runs on the platform audio thread, and
@@ -110,6 +112,7 @@ public:
 		int lateDrops; // seq at or before the newest one already decoded
 		int gapEvents;
 		int plcFrames; // concealment frames inserted
+		int fecFrames; // lost frames reconstructed from the next packet's inband FEC
 		int silenceFrames; // long-gap padding, beyond PLC
 		int driftDrops; // samples dropped to hold the latency bound
 		int underruns; // readBuffer calls that found the ring empty
@@ -173,6 +176,7 @@ private:
 	std::vector<int16_t> _pcmRing;
 	bool _haveLastSeq;
 	uint32 _lastSeq;
+	bool _wantFec; // a gap ended at the last packet: FEC-decode the next one
 
 	mutable std::mutex _mtx; // guards both rings and the counters they feed
 };

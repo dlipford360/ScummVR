@@ -96,7 +96,7 @@ GameAudio::GameAudio()
 	  _inRate(0), _tapHead(0), _tapTail(0), _resPos(0), _resStep(1),
 	  _resHaveWindow(false), _resOutFrames(0), _audioSeq(0), _decoder(nullptr),
 	  _stream(nullptr), _handle(nullptr), _pcmHead(0), _pcmTail(0),
-	  _haveLastSeq(false), _lastSeq(0) {
+	  _haveLastSeq(false), _lastSeq(0), _wantFec(false) {
 }
 
 GameAudio::~GameAudio() {
@@ -119,9 +119,16 @@ bool GameAudio::startSender(Transport *transport) {
 		return false;
 	}
 	opus_encoder_ctl(_encoder, OPUS_SET_BITRATE(kOpusBitrate));
-	// Inband FEC would help the odd lost packet, but audio loss is not this
-	// path's failure mode: the video measurements showed a healthy LAN, and
-	// the guest already conceals gaps. Leave the default.
+	// Inband FEC: on the two runs that measured the downlink with real video
+	// in flight, 13-18 % of these datagrams never arrived (rooms VWWGV,
+	// C87CK) - audio loss IS this path's failure mode, and the listener
+	// notices. FEC puts the previous frame's redundancy inside the NEXT
+	// packet, so a lost frame usually reconstructs exactly instead of leaning
+	// on concealment. The loss ratio is static at the measured rate because
+	// there is no loss estimation on this path yet (§17); Opus stays inside
+	// the bitrate cap either way.
+	opus_encoder_ctl(_encoder, OPUS_SET_INBAND_FEC(1));
+	opus_encoder_ctl(_encoder, OPUS_SET_PACKET_LOSS_PERC(15));
 
 	int rate = 0, stereo = 0;
 	Audio::Mixer *mixer = g_system->getMixer();
@@ -289,11 +296,15 @@ bool GameAudio::startReceiver() {
 		warning("coop gameaudio: opus decoder create failed (%d)", err);
 		return false;
 	}
+	// Same measured expectation as the sender's FEC setting: the decoder uses
+	// it to weight concealment against the FEC data it is being handed.
+	opus_decoder_ctl(_decoder, OPUS_SET_PACKET_LOSS_PERC(15));
 
 	_pcmRing.assign(kOpusRate * kOpusChannels * kPcmRingSeconds, 0);
 	_pcmHead = _pcmTail = 0;
 	_haveLastSeq = false;
 	_lastSeq = 0;
+	_wantFec = false;
 
 	Audio::Mixer *mixer = g_system->getMixer();
 	if (!mixer || !mixer->isReady()) {
@@ -342,7 +353,13 @@ void GameAudio::feedFrame(uint32 seq, const byte *opusBytes, int len) {
 		const uint32 gap = seq - _lastSeq - 1;
 		if (gap > 0) {
 			++_counters.gapEvents;
-			int conceal = (int)(gap < (uint32)kMaxPlcFrames ? gap : (uint32)kMaxPlcFrames);
+			// The arriving packet carries its predecessor's redundancy
+			// (sender-side inband FEC), so the *last* lost frame can be
+			// reconstructed exactly instead of concealed: hold it back here
+			// and take it from this packet below. Earlier frames stay PLC's.
+			_wantFec = true;
+			const int conceal =
+				(int)(gap < (uint32)kMaxPlcFrames ? gap : (uint32)kMaxPlcFrames) - 1;
 			int16 plc[kFrameSamples * kOpusChannels];
 			for (int i = 0; i < conceal; ++i) {
 				// NULL input is the decoder's own concealment continuation.
@@ -359,6 +376,19 @@ void GameAudio::feedFrame(uint32 seq, const byte *opusBytes, int len) {
 					pcmPush(zeros, kFrameSamples);
 				_counters.silenceFrames += silence;
 			}
+		}
+	}
+
+	// FEC first: the recovered audio belongs to the gap that just ended, so
+	// it goes into the ring before this packet's own frame. A decode_fec
+	// call returns 0 when the packet carries no redundancy - not an error.
+	if (_wantFec) {
+		_wantFec = false;
+		int16 fecPcm[kFrameSamples * kOpusChannels];
+		const int fec = opus_decode(_decoder, opusBytes, len, fecPcm, kFrameSamples, 1);
+		if (fec > 0) {
+			pcmPush(fecPcm, fec);
+			++_counters.fecFrames;
 		}
 	}
 

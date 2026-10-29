@@ -1360,10 +1360,10 @@ void runTestBody(const Config &cfg) {
 		} else {
 			audio.audio.stopReceiver();
 			debug("coop selftest: guest audio: %d frames received, %d decoded, %d late drops; "
-					"gap events %d (PLC frames %d, silence frames %d), "
+					"gap events %d (FEC-recovered %d, PLC frames %d, silence frames %d), "
 					"%d samples drift-dropped, %d underruns",
 				ac.framesReceived, ac.framesDecoded, ac.lateDrops,
-				ac.gapEvents, ac.plcFrames, ac.silenceFrames,
+				ac.gapEvents, ac.fecFrames, ac.plcFrames, ac.silenceFrames,
 				ac.driftDrops, ac.underruns);
 		}
 	}
