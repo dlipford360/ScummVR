@@ -311,6 +311,9 @@ bool startVideoRun(VideoRun *r, int frames) {
 				(byte)(16 + ((col >> 4) & 7) * 24 + ((row >> 4) & 3) * 8 + ((row / 96) & 1) * 40);
 	r->frame.assign((size_t)r->enc.inputBytes(), 0);
 	r->submitAt.assign(frames > 0 ? frames : 1, 0);
+	// Same sizing as submitAt: the capture-time carry is indexed by frame,
+	// and an unsized vector would write through a null data() on frame 0.
+	r->captureAtUs.assign(frames > 0 ? frames : 1, 0);
 	return true;
 }
 
