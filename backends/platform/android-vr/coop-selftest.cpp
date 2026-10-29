@@ -1226,13 +1226,33 @@ void runTestBody(const Config &cfg) {
 				// sent, and the report says so.
 				int64 capAt = 0;
 				if (Coop::grabCapturedFrame(video.rgba.data(), &capAt)) {
-					// Probe: the first real frame, and one ~10 s later. Two
-					// samples distinguish a static wrong (bad region, bad
-					// palette) from a dynamic one (fades, flicker).
+					// Probe: the first real frame, one ~10 s into the run,
+					// one ~90 s in. Two samples distinguish a static wrong
+					// (bad region, bad palette) from a dynamic one (fades,
+					// flicker); the third lands in the interactive part of a
+					// game intro, which is where a cursor-sensitive question
+					// (is the engine cursor in the copy?) can be answered at
+					// all - intro scenes hide it, so an early frame proves
+					// nothing. Two counter traps already hit, both settled
+					// this way: gate on the encoder tick, not captured frames
+					// (captured counts only real redraws, ~11/s for SCUMM
+					// titles, while videoFramesFed advances at the steady
+					// 30/s encode cadence, so thresholds are seconds x 30);
+					// and fire on >= with a done flag, not == - this runs
+					// only on real-frame ticks, and a game redraws on ~a
+					// third of ticks, so an exact tick number gets missed
+					// most runs. A probe is still taken only on a real
+					// frame: a dump of a duplicate would duplicate one.
+					static bool probe2Done = false, probe3Done = false;
 					if (video.captured == 0)
 						dumpCaptureProbe(video.rgba.data(), 1);
-					else if (video.captured == 300)
+					else if (!probe2Done && videoFramesFed >= 300) {
 						dumpCaptureProbe(video.rgba.data(), 2);
+						probe2Done = true;
+					} else if (!probe3Done && videoFramesFed >= 2700) {
+						dumpCaptureProbe(video.rgba.data(), 3);
+						probe3Done = true;
+					}
 					rgbaToNv12(video.rgba.data(), video.frame.data());
 					++video.captured;
 					video.haveLastFrame = true;

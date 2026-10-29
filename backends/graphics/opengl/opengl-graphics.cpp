@@ -853,6 +853,10 @@ void OpenGLGraphicsManager::updateScreen() {
 		_pipeline->drawTexture(_overlay->getGLTexture(), dstX, dstY, _overlayDrawRect.width(), _overlayDrawRect.height());
 	}
 
+	// Let the backend observe the composed frame with everything but the cursor
+	// and the OSD in it. See preCursorHook in the header.
+	preCursorHook();
+
 	// Fourth step: Draw the cursor if we didn't before.
 	if (drawCursor)
 		renderCursor();

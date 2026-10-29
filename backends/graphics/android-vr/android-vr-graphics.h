@@ -48,6 +48,7 @@ protected:
 	bool loadVideoMode(uint requestedWidth, uint requestedHeight,
 	                   bool resizable, int antialiasing) override;
 	void refreshScreen() override;
+	void preCursorHook() override;
 
 private:
 	void renderEye(int eye, const float *eyePose, const float *eyeFov);

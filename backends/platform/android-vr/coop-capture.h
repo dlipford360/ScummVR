@@ -21,25 +21,27 @@
 
 // The host's captured frames: the game's own pixels, read off the GPU.
 //
-// The guide's §6 says capture happens after the blit in
-// AndroidVRGraphicsManager::refreshScreen(), through an async readback, and
-// that is exactly this shape. Per frame, on the graphics (ScummVM) thread:
-// collect the previous frame's readback if its GPU fence has signaled, then
-// issue the current frame's glReadPixels into the other of two PBOs. Two
-// slots because a single PBO would have to be mapped while the driver might
-// still be writing it; with two, the map never races the write. The wait is
-// a zero-timeout poll: the graphics thread is never blocked on the GPU here,
-// and a frame that has not landed by the next refresh is simply missed and
-// counted (in practice the driver finishes long before, and refreshScreen
-// already ends in a glFinish).
+// The guide's §6 says capture is an async readback of the composited
+// backbuffer taken before the cursor is drawn into it - AndroidVRGraphicsManager
+// overrides the OpenGL manager's preCursorHook for exactly that. Per frame, on
+// the graphics (ScummVM) thread: collect the previous frame's readback if its
+// GPU fence has signaled, then issue the current frame's glReadPixels into the
+// other of two PBOs. Two slots because a single PBO would have to be mapped
+// while the driver might still be writing it; with two, the map never races
+// the write. The wait is a zero-timeout poll: the graphics thread is never
+// blocked on the GPU here, and a frame that has not landed by the next call is
+// simply missed and counted (in practice the driver finishes long before).
 //
-// The readback is the whole backbuffer, which is exactly what the host's own
-// virtual screen shows - the base OpenGL manager composites the game into it
-// (scaled and letterboxed by its own draw-rect logic), and a first run's
-// guess that the game "occupies the origin region" was measured wrong: probe
-// dumps showed the game at an unexpected offset with black around it (BMP
-// probes, 2026-10-23). Capturing the buffer itself removes every assumption
-// about where the game sits. The fixed 640x480 capture FBO is used only if
+// The readback is the whole backbuffer minus cursor and OSD - the same
+// composition the host's own virtual screen shows up to the cursor (the base
+// OpenGL manager composites the game into it, scaled and letterboxed by its
+// own draw-rect logic), and a first run's guess that the game "occupies the
+// origin region" was measured wrong: probe dumps showed the game at an
+// unexpected offset with black around it (BMP probes, 2026-10-23). Capturing
+// the buffer itself removes every assumption about where the game sits. The
+// cursor exclusion is M1's rule (§6): the guest gets the pointer as live 'C'
+// data, so a cursor baked into the video would double it. The fixed 640x480
+// capture FBO is used only if
 // the backbuffer is ever a different size than the encode target - one GL
 // blit does that scaling, a CPU downscale would not. Bytes cross to the
 // sending thread through the same single-slot mailbox shape the guest render

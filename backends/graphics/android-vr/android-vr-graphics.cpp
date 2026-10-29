@@ -246,14 +246,20 @@ void AndroidVRGraphicsManager::refreshScreen() {
 			GL_COLOR_BUFFER_BIT, GL_NEAREST);
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 		glFinish(); // Ensure texture is ready before VR thread reads it
-
-		// §6 capture point: the composed backbuffer itself, into the coop
-		// capture path's PBOs - the same pixels the host's own view reads.
-		// The flag is set only while something is asking for frames (the
-		// self-test's capture mode), so a plain run pays nothing here.
-		if (Coop::g_coopCaptureWant)
-			Coop::captureVideoFrame((int)_sceneWidth, (int)_sceneHeight);
 	}
+}
+
+void AndroidVRGraphicsManager::preCursorHook() {
+	// §6 capture point: the composed backbuffer with the game and overlay in
+	// it and the cursor not yet - M1's rule is that the encoder's copy
+	// carries no cursor at all, because the guest gets the pointer live as
+	// 'C' and a baked-in one would double it (client guide §6/§7). The host's
+	// own view is unaffected: its display keeps the cursor and OSD, drawn
+	// right after this hook returns. The flag is set only while something is
+	// asking for frames (the self-test's capture mode), so a plain run pays
+	// nothing here.
+	if (Coop::g_coopCaptureWant)
+		Coop::captureVideoFrame((int)_sceneWidth, (int)_sceneHeight);
 }
 
 void AndroidVRGraphicsManager::renderEye(int eye, const float *eyePose, const float *eyeFov) {

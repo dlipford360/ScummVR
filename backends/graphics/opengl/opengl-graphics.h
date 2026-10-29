@@ -141,6 +141,16 @@ public:
 protected:
 	void renderCursor();
 
+	// Observation point inside updateScreen's compositing: called with the game
+	// screen and the overlay already drawn into the backbuffer, and before the
+	// cursor and the OSD are. For backends that must take a composited copy of
+	// the frame with no backend cursor in it - the android-vr coop video, whose
+	// M1 rule is that the encoder's copy carries no cursor (the client guide
+	// §6) while the host's own display keeps everything. Note that the libretro
+	// scaler draws the cursor before the overlay, so with it the hook still
+	// observes a drawn cursor; no VR configuration builds that path.
+	virtual void preCursorHook() {}
+
 	/**
 	 * Whether a GLES or GLES2 context is active.
 	 */
