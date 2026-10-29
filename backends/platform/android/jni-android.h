@@ -122,8 +122,12 @@ public:
 	static void setAudioPlay();
 	static void setAudioStop();
 
-	static inline int writeAudio(JNIEnv *env, jbyteArray &data, int offset,
-									int size);
+	// Whether a Java AudioTrack owns the device output. The VR bootstrap
+	// never creates one; the platform audio thread then writes to the
+	// native output instead (backends/platform/android/aaudio-output.h).
+	static inline bool hasAudioTrack() { return _jobj_audio_track != 0; }
+
+	static inline int writeAudio(JNIEnv *env, jbyteArray &data, int offset,									int size);
 
 	static Common::Array<Common::String> getAllStorageLocations();
 

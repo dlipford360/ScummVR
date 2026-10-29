@@ -51,12 +51,15 @@
 #include <time.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <atomic>
 
 #if defined(__arm__) || defined(__x86_64__) || defined(__i386__)
 #include <cpu-features.h>
 #endif
 
 #include "backends/platform/android/android.h"
+#include "backends/platform/android/aaudio-output.h"
+#include "backends/platform/android/audio-tap.h"
 #include "backends/platform/android/jni-android.h"
 #include "backends/fs/android/android-fs.h"
 #include "backends/fs/android/android-fs-factory.h"
@@ -313,6 +316,19 @@ void *OSystem_Android::timerThreadFunc(void *arg) {
 	return 0;
 }
 
+// The mixed-output tap (backends/platform/android/audio-tap.h). One word,
+// read once per audio-thread iteration; the setter's store is the whole
+// synchronization contract.
+static std::atomic<Android::AudioOutputTap> g_audioOutputTap(nullptr);
+
+namespace Android {
+
+void setAudioOutputTap(AudioOutputTap tap) {
+	g_audioOutputTap.store(tap, std::memory_order_relaxed);
+}
+
+} // namespace Android
+
 void *OSystem_Android::audioThreadFunc(void *arg) {
 	JNI::attachThread();
 
@@ -324,6 +340,13 @@ void *OSystem_Android::audioThreadFunc(void *arg) {
 	JNIEnv *env = JNI::getEnv();
 
 	jbyteArray bufa = env->NewByteArray(buf_size);
+
+	// VR mode creates no Java AudioTrack, so the mixed output needs the
+	// native device (backends/platform/android/aaudio-output.h). If that
+	// cannot be opened, everything below behaves exactly as it did before:
+	// the mixer keeps mixing and the device ignores it.
+	const bool nativeOut = !JNI::hasAudioTrack() &&
+		Android::DeviceAudio::start(system->_audio_sample_rate, 2);
 
 	bool paused = true;
 
@@ -344,6 +367,8 @@ void *OSystem_Android::audioThreadFunc(void *arg) {
 	while (!system->_audio_thread_exit) {
 		if (JNI::pause) {
 			JNI::setAudioStop();
+			if (nativeOut)
+				Android::DeviceAudio::pause();
 
 			paused = true;
 			silence_count = 33;
@@ -357,6 +382,17 @@ void *OSystem_Android::audioThreadFunc(void *arg) {
 		assert(buf);
 
 		int samples = mixer->mixCallback(buf, buf_size);
+
+		// mixCallback returns sample frames, not bytes. Tap the complete
+		// zero-initialized output buffer, including any silent tail, to
+		// preserve the device timeline (see audio-tap.h).
+		// Reading the pointer once keeps the call
+		// consistent with the store; a null tap is the common case and
+		// costs one predictable branch.
+		if (samples > 0) {
+			if (Android::AudioOutputTap tap = g_audioOutputTap.load(std::memory_order_relaxed))
+				tap(buf, buf_size);
+		}
 
 		bool silence = samples < 1;
 
@@ -385,6 +421,8 @@ void *OSystem_Android::audioThreadFunc(void *arg) {
 					LOGD("AudioTrack pause");
 
 					JNI::setAudioPause();
+					if (nativeOut)
+						Android::DeviceAudio::pause();
 					paused = true;
 				}
 
@@ -398,6 +436,8 @@ void *OSystem_Android::audioThreadFunc(void *arg) {
 			LOGD("AudioTrack play");
 
 			JNI::setAudioPlay();
+			if (nativeOut)
+				Android::DeviceAudio::resume();
 			paused = false;
 
 			silence_count = 0;
@@ -408,7 +448,16 @@ void *OSystem_Android::audioThreadFunc(void *arg) {
 		written = 0;
 
 		while (left > 0) {
-			written = JNI::writeAudio(env, bufa, offset, left);
+			if (nativeOut) {
+				// The critical array was released after the mix, so the
+				// bytes live in the Java array now; take them back for a
+				// plain native write (same buffer, one pointer hop).
+				byte *wb = (byte *)env->GetPrimitiveArrayCritical(bufa, 0);
+				written = Android::DeviceAudio::write(wb + offset, left);
+				env->ReleasePrimitiveArrayCritical(bufa, wb, 0);
+			} else {
+				written = JNI::writeAudio(env, bufa, offset, left);
+			}
 
 			if (written < 0) {
 				LOGE("AudioTrack error: %d", written);
@@ -430,6 +479,8 @@ void *OSystem_Android::audioThreadFunc(void *arg) {
 	}
 
 	JNI::setAudioStop();
+	if (nativeOut)
+		Android::DeviceAudio::stopAndClose();
 
 	env->DeleteLocalRef(bufa);
 

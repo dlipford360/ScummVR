@@ -40,6 +40,7 @@
 
 #include "backends/platform/android-vr/coop-encode.h"
 #include "backends/platform/android-vr/coop-decode.h"
+#include "backends/platform/android-vr/coop-gameaudio.h"
 
 #ifdef __ANDROID__
 // The control plane is the Java HTTP stack, which needs a JNIEnv on the calling
@@ -96,6 +97,10 @@ struct Config {
 	// capture run has a real animated scene without anyone putting on the
 	// headset. Empty = leave the launcher alone.
 	char gameTarget[64];
+	// 0 = no game audio, 1 = tap the mixer output and send Opus 'A' frames
+	// (host role), 2 = receive 'A' frames and play them through the mixer
+	// (guest role). Independent of videoMode: audio can be measured alone.
+	int audioMode;
 };
 
 void trim(char *text) {
@@ -163,6 +168,11 @@ bool readConfig(const char *path, Config *out) {
 			out->capture = !strcmp(value, "true") || atoi(value) != 0;
 		} else if (!strcmp(key, "game")) {
 			snprintf(out->gameTarget, sizeof(out->gameTarget), "%s", value);
+		} else if (!strcmp(key, "audio")) {
+			if (!strcmp(value, "send"))
+				out->audioMode = 1;
+			else if (!strcmp(value, "recv"))
+				out->audioMode = 2;
 		} else if (!strcmp(key, "seconds")) {
 			out->seconds = atoi(value);
 			if (out->seconds < 1)
@@ -779,6 +789,32 @@ void feedVideoFragment(DecodeRun *r, const Transport::Event &event) {
 	}
 }
 
+// Game audio over the room (audio=send/recv). The frame counter GameAudio uses
+// is its own; the reassembler is deliberately separate from the video one
+// (FrameReassembler is per media kind by contract). At 32 kbps a 20 ms Opus
+// frame is ~80 bytes - one fragment - but the reassembler keeps the receive
+// path correct if that ever stops being true.
+struct AudioRun {
+	Coop::GameAudio audio;
+	Wire::FrameReassembler reassembler;
+	bool active;
+};
+
+void feedAudioFragment(AudioRun *r, const Transport::Event &event) {
+	if (event.payloadLen <= Wire::kFragHeaderBytes)
+		return;
+	uint32 frameId = 0;
+	uint16 index = 0, count = 0;
+	if (!Wire::readFragmentHeader(event.payload, event.payloadLen, &frameId, &index, &count))
+		return;
+	Wire::FrameReassembler::Complete done;
+	if (!r->reassembler.feed(frameId, index, count,
+			event.payload + Wire::kFragHeaderBytes,
+			event.payloadLen - Wire::kFragHeaderBytes, &done))
+		return;
+	r->audio.feedFrame(done.frameId, done.data, done.len);
+}
+
 // Ask the host, at most every kRnrIntervalMs, for whole frames that never
 // arrived. Whole frames rather than fragments: a partial video frame is
 // worthless by construction (the reassembler drops it), so its full value is
@@ -1049,6 +1085,32 @@ void runTestBody(const Config &cfg) {
 	int64 videoNextMs = videoStartMs;
 	int64 lastContentCapUs = 0; // capture time of the newest real pixels, carried across re-feeds
 
+	// audio=send/recv: the game-audio path. Independent of video on purpose -
+	// it shares only the room - so a run can measure one leg without the other.
+	// The sender is started before the loop and pumps inside it; the tap it
+	// installs costs one relaxed load per audio buffer while it waits.
+	AudioRun audio;
+	audio.active = false;
+	if (cfg.audioMode == 1) {
+		if (!cfg.asHost) {
+			warning("coop selftest: audio=send needs role=host (a guest's A frames would reach no one); skipping");
+		} else if (!audio.audio.startSender(&transport)) {
+			warning("coop selftest: the game-audio sender could not start (mixer or Opus)");
+		} else {
+			audio.active = true;
+			debug("coop selftest: game-audio sender started - 20 ms Opus frames as 'A' at 32 kbps");
+		}
+	} else if (cfg.audioMode == 2) {
+		if (cfg.asHost) {
+			warning("coop selftest: audio=recv needs role=guest (a host would receive nothing); skipping");
+		} else if (!audio.audio.startReceiver()) {
+			warning("coop selftest: the game-audio receiver could not start (mixer or Opus)");
+		} else {
+			audio.active = true;
+			debug("coop selftest: game-audio receiver started - 'A' frames play through the mixer");
+		}
+	}
+
 	// Stay joined, send one application frame a second, and report everything the
 	// relay sends back. With two headsets this is where a sealed frame crossing a
 	// real relay in both directions gets proven.
@@ -1067,7 +1129,9 @@ void runTestBody(const Config &cfg) {
 				// In recv mode the V stream is the measurement, and at 30 fps
 				// it is also ~27 datagrams a second - per-fragment debug would
 				// bury every other line. The DecodeRun counters are the report.
-				if (event.header.type == 'V' && decode.dec.isOpen()) {
+				if (event.header.type == 'A' && audio.active) {
+					feedAudioFragment(&audio, event);
+				} else if (event.header.type == 'V' && decode.dec.isOpen()) {
 					feedVideoFragment(&decode, event);
 				} else if (video.sendRoom && handleRetransmitRequest(&video, event)) {
 					// A retransmit the host answered (counted, not logged:
@@ -1135,6 +1199,11 @@ void runTestBody(const Config &cfg) {
 		// kRnrIntervalMs inside).
 		if (decode.dec.isOpen())
 			flushRetransmitRequests(&decode, &transport);
+
+		// Game audio: the tap ring fills at real time, so this cannot run
+		// ahead of the game; it just has to be called often enough.
+		if (audio.active)
+			audio.audio.pump();
 
 		if (videoOn && nowMs() >= videoNextMs) {
 			// Real pacing: the frame timer, not the loop tick. Drift is
@@ -1243,6 +1312,8 @@ void runTestBody(const Config &cfg) {
 		while (transport.pollEvent(&event)) {
 			if (event.kind == Wire::kRecvData && event.header.type == 'V')
 				feedVideoFragment(&decode, event);
+			else if (event.kind == Wire::kRecvData && event.header.type == 'A' && audio.active)
+				feedAudioFragment(&audio, event);
 		}
 		decode.dec.drain(1000, decodeCb, &decode);
 		reportDecodeRun(&decode, cfg.seconds);
@@ -1274,8 +1345,30 @@ void runTestBody(const Config &cfg) {
 		}
 	}
 
-	debug("coop selftest: done after %d s - %u frames in (%u data, %u roster, %u control), "
-			"%d app frames and %d probe media frames sent, dropped events %u, bad packets %u, crypto drops %u, "
+	if (audio.active) {
+		// Audio stats in the same spirit as the video ones: the counters are
+		// the report, and the human verdict (did the guest headset *play* the
+		// host's game, in sync, without artifacts) rides on this line.
+		const Coop::GameAudio::Counters ac = audio.audio.counters();
+		if (cfg.audioMode == 1) {
+			audio.audio.stopSender();
+			debug("coop selftest: host audio: %d Opus frames sent (%lld bytes), "
+					"%d send failures; tap saw %lld bytes, %d input samples dropped (ring full), "
+					"%d starved ticks",
+				ac.framesEncoded, (long long)ac.bytesSent,
+				ac.sendFailures, (long long)ac.tapBytes, ac.tapRingDrops, ac.encodeSkips);
+		} else {
+			audio.audio.stopReceiver();
+			debug("coop selftest: guest audio: %d frames received, %d decoded, %d late drops; "
+					"gap events %d (PLC frames %d, silence frames %d), "
+					"%d samples drift-dropped, %d underruns",
+				ac.framesReceived, ac.framesDecoded, ac.lateDrops,
+				ac.gapEvents, ac.plcFrames, ac.silenceFrames,
+				ac.driftDrops, ac.underruns);
+		}
+	}
+
+	debug("coop selftest: done after %d s - %u frames in (%u data, %u roster, %u control), "			"%d app frames and %d probe media frames sent, dropped events %u, bad packets %u, crypto drops %u, "
 			"HELLO written %u, datagrams in %u",
 		cfg.seconds, framesIn, dataIn, rosterIn, controlIn, appSeq, mediaProbes,
 		transport.droppedEvents(), transport.badPackets(), transport.cryptoDrops(),
