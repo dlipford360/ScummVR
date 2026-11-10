@@ -308,4 +308,9 @@ __pycache__/
 
 #Ignore vcpkg generated files
 /vcpkg_installed/
-android_project_vr/
+# VR APK project: tracked source, ignored machine state and binaries.
+/android_project_vr/local.properties
+/android_project_vr/src.properties
+/android_project_vr/.gradle/
+/android_project_vr/build/
+/android_project_vr/lib/
