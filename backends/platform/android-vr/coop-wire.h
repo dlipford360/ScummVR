@@ -59,7 +59,10 @@ const int kFragHeaderBytes = 8;
 // Derived here so the arithmetic lives in one place.
 const int kMaxFragmentBytes = kMaxPayloadBytes - kEnvelopeBytes - kTagBytes - kFragHeaderBytes;
 
-const int kMaxRoomCodeLen = 8;
+// A room's address on every channel (HTTP path, UDP HELLO/BYE, headers).
+// Generated codes are 5 chars; a host-chosen name ("MARTY123") may run to
+// the relay's 20-character cap, and both ride the same fields.
+const int kMaxRoomCodeLen = 20;
 const int kMaxRoomCodeBytes = kMaxRoomCodeLen + 1;
 
 // Recipient marker inside application ("X") payloads. Fan-out on the relay is

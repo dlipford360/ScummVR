@@ -42,6 +42,11 @@
 #include "backends/platform/android-vr/coop-decode.h"
 #include "backends/platform/android-vr/coop-gameaudio.h"
 #include "backends/platform/android-vr/coop-cursor.h"
+#include "backends/platform/android-vr/coop-interactive.h"
+
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 #ifdef __ANDROID__
 // The control plane is the Java HTTP stack, which needs a JNIEnv on the calling
@@ -74,7 +79,10 @@ const char *const kDefaultMarkerPaths[] = {
 // the host's video window wide open while the guest starts (a 60 s cap made
 // a late-joining guest race an already-finished host, 2026-10-23); 5 minutes
 // is comfortable and still bounded.
-const int kMaxRunSeconds = 300;
+// Upper bound on a bounded run's `seconds` key. Long enough that a demo does
+// not hit it mid-scene (the 300 s original clamped a 600 s request silently —
+// the run "ended on its own" 5 minutes in, which reads like a liveness bug).
+const int kMaxRunSeconds = 900;
 
 struct Config {
 	char baseUrl[160];
@@ -111,6 +119,10 @@ struct Config {
 	int cursorMode;
 	bool cursorDraw;
 	int cursorHz;
+	// Host-only: create the room open, so guests join with the room code alone
+	// (typed on the gaze keyboard) instead of code + 32-hex invite. The invite
+	// still exists; the relay simply does not demand it for this room.
+	bool openRoom;
 };
 
 void trim(char *text) {
@@ -200,6 +212,8 @@ bool readConfig(const char *path, Config *out) {
 				out->cursorMode = 3;
 			else
 				warning("coop selftest: cursor value must be \"send\", \"recv\" or \"both\", got \"%s\"", value);
+		} else if (!strcmp(key, "open")) {
+			out->openRoom = !strcmp(value, "true") || atoi(value) != 0;
 		} else if (!strcmp(key, "seconds")) {
 			out->seconds = atoi(value);
 			if (out->seconds < 1)
@@ -949,7 +963,7 @@ void runTestBody(const Config &cfg) {
 	session.setBaseUrl(Common::String(cfg.baseUrl));
 
 	const bool requested = cfg.asHost
-		? session.createRoom(cfg.ownerName[0] ? cfg.ownerName : "headset")
+		? session.createRoom(cfg.ownerName[0] ? cfg.ownerName : "headset", cfg.openRoom)
 		: session.joinRoom(cfg.code, cfg.invite);
 	if (!requested) {
 		char reason[Wire::kMaxHeaderBytes];
@@ -1002,8 +1016,13 @@ void runTestBody(const Config &cfg) {
 		session.copyOwnerCredentials(&owner);
 		// This is the one place a room code and an invite are printed on purpose:
 		// it is how the second headset is pointed at the same room. Both are
-		// room-scoped, and neither is the owner secret.
-		debug("coop selftest: join the second headset with code=%s invite=%s", p.code, owner.invite);
+		// room-scoped, and neither is the owner secret. An open room does not
+		// need the invite at all, and the line says so - no one should hunt for
+		// a secret the relay stopped asking for.
+		if (cfg.openRoom)
+			debug("coop selftest: join the second headset with code=%s (open room: no invite needed)", p.code);
+		else
+			debug("coop selftest: join the second headset with code=%s invite=%s", p.code, owner.invite);
 	}
 
 	benchSealing(p.mediaKeyHex, p.code, p.role, p.peerId);
@@ -1172,7 +1191,7 @@ void runTestBody(const Config &cfg) {
 	int64 nextSend = nowMs();
 	const int64 runStartedMs = nowMs();
 	const int64 until = runStartedMs + (int64)cfg.seconds * 1000;
-	while (nowMs() < until && !transport.isClosed()) {
+	while (nowMs() < until && !transport.isClosed() && !g_coopUiLeaveWanted) {
 		Transport::Event event;
 		while (transport.pollEvent(&event)) {
 			++framesIn;
@@ -1521,7 +1540,561 @@ void runTest(const Config &cfg) {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// The interactive join service (coop-interactive.h). Same thread recipe as
+// runTest - JVM attached, control plane on this thread - but it lives until
+// LEAVE ROOM rather than until a timer, and it runs the guest half of a room:
+// receive video to the quad, receive audio to the mixer, send and draw the
+// pointer circles. The framing it reuses (feedVideoFragment's reassembly,
+// flushRetransmitRequests' NACK pacing, feedAudioFragment's FEC-aware gap
+// handling) is this file's statics; moving that machinery into the service is
+// the same move the header comment anticipates - these files become the
+// product entry point together.
+
+// Published here (namespace Coop scope), consumed by the VR thread; the
+// join request is the other direction, behind a mutex because the VR thread
+// fires it whenever a trigger edge lands on SUBMIT. `create` picks the role:
+// `code` then carries the host-chosen room NAME instead of an existing one.
+struct UiRequest {
+	std::mutex mutex;
+	std::condition_variable cond;
+	bool pending = false;
+	bool create = false;
+	char code[Wire::kMaxRoomCodeBytes];
+	char invite[64];
+};
+
+UiRequest g_coopUiReq;
+
+// Single source of truth for "who asked to end this run": both loops read it,
+// nothing else writes it.
+
+void setUiStatus(const char *text) {
+	strncpy(g_coopUiStatus, text, sizeof(g_coopUiStatus) - 1);
+	g_coopUiStatus[sizeof(g_coopUiStatus) - 1] = 0;
+}
+
+// The toast channel: text first, then the sequence bump (both sides are
+// seq_cst, so the VR thread reads a whole string).
+void publishNotice(const char *text) {
+	strncpy(g_coopUiNotice, text, sizeof(g_coopUiNotice) - 1);
+	g_coopUiNotice[sizeof(g_coopUiNotice) - 1] = 0;
+	g_coopUiNoticeSeq.fetch_add(1);
+}
+
+// Map the relay's last control line to a toast. The transport keeps that
+// line verbatim and CLOSED/KICKED/DENY are the terminal ones; a voluntary
+// LEAVE maps to no toast at all, because pressing the button is its own
+// answer. "host_left" is the reason a relay sends when the host's BYE ends
+// the room - the case that used to leave the guest holding a frozen frame.
+const char *noticeForClose(bool voluntaryLeave, const char *lastCtl) {
+	if (voluntaryLeave)
+		return nullptr;
+	if (strstr(lastCtl, "host_left"))
+		return "HOST LEFT THE ROOM";
+	if (strstr(lastCtl, "idle"))
+		return "ROOM EXPIRED";
+	if (strstr(lastCtl, "KICKED"))
+		return "YOU WERE REMOVED";
+	if (strstr(lastCtl, "DENY"))
+		return "SESSION REFUSED";
+	return "ROOM ENDED";
+}
+
+void serviceFailed(const char *reason) {
+	warning("coop service: %s", reason);
+	setUiStatus(reason);
+	// The panel may well be closed by now (SUBMIT closes it the moment the
+	// request queues), so status alone would be invisible: a refused join
+	// has to arrive as a toast.
+	publishNotice(reason);
+	g_coopUiRoomLine[0] = 0;
+	g_coopUiState = kUiIdle;
+}
+
+void ensureUiService();
+
+void joinServiceBody() {
+	char code[sizeof(g_coopUiReq.code)], invite[sizeof(g_coopUiReq.invite)];
+	{
+		std::lock_guard<std::mutex> lock(g_coopUiReq.mutex);
+		strcpy(code, g_coopUiReq.code);
+		strcpy(invite, g_coopUiReq.invite);
+		g_coopUiReq.pending = false;
+	}
+	g_coopUiState = kUiJoining;
+	setUiStatus("joining...");
+	debug("coop service: join requested for room %s", code);
+
+	// Control plane, version gate, participant: the same gate order the
+	// self-test proved, with the marker's relay replaced by the compiled one.
+	Session session;
+	session.setBaseUrl(Common::String(COOP_UI_RELAY_BASE));
+	if (!session.joinRoom(code, invite)) {
+		serviceFailed("could not queue the join request");
+		return;
+	}
+	const int64 deadline = nowMs() + 15000;
+	while (session.pending() && nowMs() < deadline)
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	if (session.pending()) {
+		serviceFailed("relay unreachable (15 s)");
+		return;
+	}
+	if (!session.lastRequestOk()) {
+		char reason[Wire::kMaxHeaderBytes];
+		session.copyError(reason, sizeof(reason));
+		Common::String msg(Common::String("refused: ") + reason);
+		serviceFailed(msg.c_str());
+		return;
+	}
+	if (!session.gateOk()) {
+		serviceFailed("version gate refused the relay");
+		return;
+	}
+	if (!session.haveParticipant()) {
+		serviceFailed("no participant in the response");
+		return;
+	}
+	Participant p;
+	session.copyParticipant(&p);
+
+	Transport transport;
+	if (!transport.open(p.relayHost, p.relayPort)) {
+		serviceFailed("could not open a UDP socket to the relay");
+		return;
+	}
+	if (!transport.setMediaKey(p.mediaKeyHex)) {
+		serviceFailed("the transport refused the media key");
+		transport.close();
+		return;
+	}
+	if (!transport.join(p.code, p.peerId, p.sessionSecret, p.role)) {
+		char status[Wire::kMaxHeaderBytes];
+		transport.statusText(status, sizeof(status));
+		Common::String msg(Common::String("join refused: ") + status);
+		serviceFailed(msg.c_str());
+		transport.close();
+		return;
+	}
+	const int64 joinedAt = nowMs();
+	while (!transport.isReady() && !transport.isClosed() && nowMs() < joinedAt + 10000)
+		std::this_thread::sleep_for(std::chrono::milliseconds(25));
+	if (!transport.isReady()) {
+		serviceFailed("no WELCOME from the relay (10 s)");
+		transport.close();
+		return;
+	}
+
+	g_coopUiState = kUiJoined;
+	snprintf(g_coopUiRoomLine, sizeof(g_coopUiRoomLine), "ROOM %s  peer %u", p.code, p.peerId);
+	setUiStatus("in the room");
+
+	// The guest media half, exactly the shape the controlled runs measured
+	// healthy (Ethernet-relayed room XKBCT: 1,938 rendered frames / 75 s).
+	DecodeRun decode;
+	if (decode.dec.open(kVideoWidth, kVideoHeight)) {
+		g_coopVideoDisplayWant = true;
+	} else {
+		warning("coop service: no usable H.264 decoder; audio and cursors only");
+	}
+
+	AudioRun audio;
+	audio.active = false;
+	if (audio.audio.startReceiver())
+		audio.active = true;
+	else
+		warning("coop service: the game-audio receiver could not start");
+
+	// Our pointer ships at the same 30 Hz latest-state cadence; the VR thread
+	// publishes the sample from the same ray this device already sends when
+	// the self-test drives it.
+	g_coopCursorSendWant = true;
+	const int kCursorHz = 30;
+	int64 cursorNextMs = nowMs();
+	int cursorTicks = 0;
+	int64 nextClockMs = 0;
+
+	while (!g_coopUiLeaveWanted && !transport.isClosed()) {
+		Transport::Event event;
+		while (transport.pollEvent(&event)) {
+			if (event.kind == Wire::kRecvData) {
+				if (event.header.type == 'A' && audio.active) {
+					feedAudioFragment(&audio, event);
+				} else if (event.header.type == 'V' && decode.dec.isOpen()) {
+					feedVideoFragment(&decode, event);
+				} else if (event.header.type == 'C') {
+					Coop::receivePeerCursor(event.header.peerId, event.payload, event.payloadLen);
+					g_coopCursorDisplayWant = true;
+				}
+			} else if (event.kind == Wire::kRecvRoster) {
+				// The roster is JSON entries keyed by peerId; counting that
+				// field is honest enough for a headcount and cheaper than a
+				// parser at this size.
+				int peers = 0;
+				for (const char *q = event.text; (q = strstr(q, "\"peerId\"")) != nullptr; ) {
+					++peers;
+					++q;
+				}
+				if (peers > 0)
+					snprintf(g_coopUiRoomLine, sizeof(g_coopUiRoomLine),
+						"ROOM %s  %d PEERS", p.code, peers);
+			} else if (event.kind == Wire::kRecvControl) {
+				debug("coop service: control: %s", event.text);
+			}
+		}
+
+		if (decode.dec.isOpen())
+			flushRetransmitRequests(&decode, &transport);
+		if (audio.active)
+			audio.audio.pump();
+
+		const int64 now = nowMs();
+		if (now >= cursorNextMs) {
+			uint16 cx, cy;
+			bool vis;
+			if (Coop::grabCursorSample(&cx, &cy, &vis)) {
+				byte payload[5];
+				Coop::encodeCursorPayload(payload, sizeof(payload), cx, cy, vis);
+				transport.sendFrame('C', payload, sizeof(payload));
+			}
+			cursorNextMs = now + 1000 / kCursorHz;
+			++cursorTicks;
+		}
+		if (now >= nextClockMs) {
+			if (transport.clockSynced()) {
+				g_coopClockOffsetUs = transport.clockEpochOffsetUs();
+				g_coopClockSynced = true;
+			}
+			nextClockMs = now + 500;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(3));
+	}
+
+	// Teardown, outward-in: socket (BYE rides in close()), audio stream,
+	// then the want-flags so the VR thread stops touching video, cursors and
+	// the clock. Stale peer circles expire on their own (2 s); the display
+	// flag going false stops drawing them immediately.
+	const bool wasClosed = transport.isClosed();
+	char lastCtl[Wire::kMaxHeaderBytes];
+	transport.statusText(lastCtl, sizeof(lastCtl)); // survives close(); it is
+	transport.close();                               // the why of a dead room
+	if (audio.active)
+		audio.audio.stopReceiver();
+	if (decode.dec.isOpen())
+		decode.dec.close();
+	g_coopVideoDisplayWant = false;
+	g_coopCursorDisplayWant = false;
+	g_coopCursorSendWant = false;
+	g_coopUiRoomLine[0] = 0;
+	setUiStatus(wasClosed ? "room ended by the relay" : "left the room");
+	if (const char *note = noticeForClose(!wasClosed, lastCtl))
+		publishNotice(note); // "HOST LEFT THE ROOM": the guest auto-leaves and says why
+	g_coopUiState = kUiIdle;
+	debug("coop service: joined %lld s, teardown complete",
+		(long long)(nowMs() - joinedAt) / 1000);
+}
+
+// CREATE ROOM: this headset names a NEW open room and becomes its host -
+// the same role the marker self-test drives with role=host/video=send/
+// capture=true, reached from the UI instead of a file. The other headset
+// JOIN ROOMs by typing the name. The media loop is the host half of the
+// self-test run loop with the measurement scaffolding (probes, latency
+// tables, reports) stripped: the interactive job is to be watched, not to
+// measure being watched.
+void createServiceBody() {
+	char name[sizeof(g_coopUiReq.code)];
+	{
+		std::lock_guard<std::mutex> lock(g_coopUiReq.mutex);
+		strcpy(name, g_coopUiReq.code);
+		g_coopUiReq.code[0] = 0;
+		g_coopUiReq.invite[0] = 0;
+		g_coopUiReq.create = false;
+		g_coopUiReq.pending = false;
+	}
+	g_coopUiState = kUiJoining;
+	setUiStatus("creating room...");
+	debug("coop service: create requested, room name %s", name);
+
+	Session session;
+	session.setBaseUrl(Common::String(COOP_UI_RELAY_BASE));
+	if (!session.createRoom("headset", true, name)) {
+		serviceFailed("could not queue the create request");
+		return;
+	}
+	const int64 deadline = nowMs() + 15000;
+	while (session.pending() && nowMs() < deadline)
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	if (session.pending()) {
+		serviceFailed("relay unreachable (15 s)");
+		return;
+	}
+	if (!session.lastRequestOk()) {
+		// The two failures a typed name can actually hit: invalid_room_name
+		// (the UI pre-validates, so this is the relay disagreeing) and
+		// name_taken - both read better as the relay's own word than as a
+		// translation of it.
+		char reason[Wire::kMaxHeaderBytes];
+		session.copyError(reason, sizeof(reason));
+		Common::String msg(Common::String("refused: ") + reason);
+		serviceFailed(msg.c_str());
+		return;
+	}
+	if (!session.gateOk()) {
+		serviceFailed("version gate refused the relay");
+		return;
+	}
+	if (!session.haveParticipant()) {
+		serviceFailed("no participant in the response");
+		return;
+	}
+	Participant p;
+	session.copyParticipant(&p);
+
+	Transport transport;
+	if (!transport.open(p.relayHost, p.relayPort)) {
+		serviceFailed("could not open a UDP socket to the relay");
+		return;
+	}
+	if (!transport.setMediaKey(p.mediaKeyHex)) {
+		serviceFailed("the transport refused the media key");
+		transport.close();
+		return;
+	}
+	if (!transport.join(p.code, p.peerId, p.sessionSecret, p.role)) {
+		char status[Wire::kMaxHeaderBytes];
+		transport.statusText(status, sizeof(status));
+		Common::String msg(Common::String("join refused: ") + status);
+		serviceFailed(msg.c_str());
+		transport.close();
+		return;
+	}
+	const int64 joinedAt = nowMs();
+	while (!transport.isReady() && !transport.isClosed() && nowMs() < joinedAt + 10000)
+		std::this_thread::sleep_for(std::chrono::milliseconds(25));
+	if (!transport.isReady()) {
+		serviceFailed("no WELCOME from the relay (10 s)");
+		transport.close();
+		return;
+	}
+
+	g_coopUiState = kUiJoined;
+	snprintf(g_coopUiRoomLine, sizeof(g_coopUiRoomLine), "ROOM %s  HOST", p.code);
+	setUiStatus("hosting - others join by name");
+	debug("coop service: hosting room %s as peer %u (open room)", p.code, p.peerId);
+
+	// The host media half: capture -> encode -> 'V', exactly the shape the
+	// marker runs shipped. If the encoder is unavailable the room still
+	// exists and cursors/audio keep working - being a room host is not the
+	// same job as being a video host.
+	VideoRun video;
+	bool videoOn = false;
+	if (!startVideoRun(&video, kMaxRunSeconds * kVideoFps)) {
+		warning("coop service: no usable H.264 encoder; hosting audio and cursors only");
+	} else {
+		video.sendRoom = true;
+		video.transport = &transport;
+		transport.enableMediaHistory(); // answers the guest's retransmit requests
+		videoOn = true;
+		video.rgba.resize((size_t)Coop::kCapBytes);
+		Coop::g_coopCaptureWant = true;
+	}
+
+	AudioRun audio;
+	audio.active = false;
+	if (!audio.audio.startSender(&transport))
+		warning("coop service: the game-audio sender could not start (mixer or Opus)");
+	else
+		audio.active = true;
+
+	g_coopCursorSendWant = true;
+
+	const int kCursorHz = 30;
+	int64 cursorNextMs = nowMs();
+	int64 videoNextMs = nowMs();
+	int64 nextClockMs = 0;
+	int videoFramesFed = 0;
+	int64 lastContentCapUs = 0;
+	bool warnedNoCapture = false;
+
+	while (!g_coopUiLeaveWanted && !transport.isClosed()) {
+		Transport::Event event;
+		while (transport.pollEvent(&event)) {
+			if (event.kind == Wire::kRecvData) {
+				if (video.sendRoom && handleRetransmitRequest(&video, event)) {
+					// A retransmit answered (counted, not logged).
+				} else if (event.header.type == 'C') {
+					Coop::receivePeerCursor(event.header.peerId, event.payload, event.payloadLen);
+					g_coopCursorDisplayWant = true;
+				}
+			} else if (event.kind == Wire::kRecvRoster) {
+				int peers = 0;
+				for (const char *q = event.text; (q = strstr(q, "\"peerId\"")) != nullptr; ) {
+					++peers;
+					++q;
+				}
+				if (peers > 0)
+					snprintf(g_coopUiRoomLine, sizeof(g_coopUiRoomLine),
+						"ROOM %s  %d PEERS", p.code, peers);
+			} else if (event.kind == Wire::kRecvControl) {
+				debug("coop service: control: %s", event.text);
+			}
+		}
+
+		if (audio.active)
+			audio.audio.pump();
+
+		const int64 now = nowMs();
+		if (videoOn && now >= videoNextMs) {
+			// The re-feed design from the marker runs, kept whole: feed the
+			// encoder at the encode cadence, duplicates included, because
+			// feeding at the game's ~11 fps redraw rate puts a frame-wait
+			// into every latency sample (§14). A guest sees a held frame,
+			// not a stutter, and the pipeline stays paced.
+			if (videoFramesFed >= (int)video.submitAt.size()) {
+				videoOn = false; // the same 900 s window a marker run caps at
+				setUiStatus("hosting - video window ended");
+				warning("coop service: the %d s video window ended; audio and cursors continue",
+					kMaxRunSeconds);
+			} else {
+				int64 capAt = 0;
+				if (Coop::grabCapturedFrame(video.rgba.data(), &capAt)) {
+					rgbaToNv12(video.rgba.data(), video.frame.data());
+					++video.captured;
+					video.haveLastFrame = true;
+				} else {
+					++video.missedCapture;
+					if (!warnedNoCapture && now - joinedAt > 8000) {
+						warnedNoCapture = true;
+						warning("coop service: capture has produced no frame after 8 s - "
+							"launch a game and guests will see it (the launcher itself is visible too)");
+					}
+				}
+				if (video.haveLastFrame) {
+					if (capAt != 0)
+						lastContentCapUs = capAt;
+					video.submitAt[videoFramesFed] = nowUs();
+					video.captureAtUs[videoFramesFed] = lastContentCapUs;
+					if (!video.enc.submitFrame(video.frame.data(),
+							(int64)videoFramesFed * 1000000 / kVideoFps, videoAu, &video)) {
+						warning("coop service: the encoder failed at frame %d; video stops, the room does not",
+							videoFramesFed);
+						videoOn = false;
+					}
+					++videoFramesFed;
+				}
+				videoNextMs = now + 1000 / kVideoFps;
+			}
+		}
+		if (now >= cursorNextMs) {
+			uint16 cx, cy;
+			bool vis;
+			if (Coop::grabCursorSample(&cx, &cy, &vis)) {
+				byte payload[5];
+				Coop::encodeCursorPayload(payload, sizeof(payload), cx, cy, vis);
+				transport.sendFrame('C', payload, sizeof(payload));
+			}
+			cursorNextMs = now + 1000 / kCursorHz;
+		}
+		if (now >= nextClockMs) {
+			if (transport.clockSynced()) {
+				g_coopClockOffsetUs = transport.clockEpochOffsetUs();
+				g_coopClockSynced = true;
+			}
+			nextClockMs = now + 500;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(3));
+	}
+
+	// Teardown, outward-in, same order as the guest loop's. The encoder and
+	// sender are stopped before the want-flags drop so nothing publishes
+	// into a closed socket. A host's BYE leaves the room to the relay's own
+	// lifetime rules - guests see the end as a relay-side close.
+	const bool wasClosed = transport.isClosed();
+	char lastCtl[Wire::kMaxHeaderBytes];
+	transport.statusText(lastCtl, sizeof(lastCtl));
+	transport.close();
+	if (audio.active)
+		audio.audio.stopSender();
+	Coop::g_coopCaptureWant = false;
+	g_coopCursorDisplayWant = false;
+	g_coopCursorSendWant = false;
+	g_coopUiRoomLine[0] = 0;
+	setUiStatus(wasClosed ? "room ended by the relay" : "closed the room");
+	if (const char *note = noticeForClose(!wasClosed, lastCtl))
+		publishNotice(note); // a failsafe kick reaches the host the same way
+	g_coopUiState = kUiIdle;
+	debug("coop service: hosted %lld s, %d frames encoded, %d captured, teardown complete",
+		(long long)(nowMs() - joinedAt) / 1000, videoFramesFed, video.captured);
+}
+
+void serviceThread() {
+#ifdef __ANDROID__
+	JNI::attachThread();
+#endif
+	for (;;) {
+		bool create;
+		{
+			std::unique_lock<std::mutex> lock(g_coopUiReq.mutex);
+			g_coopUiReq.cond.wait(lock, [] { return g_coopUiReq.pending; });
+			create = g_coopUiReq.create; // the body below takes the rest
+		}
+		if (create)
+			createServiceBody();
+		else
+			joinServiceBody();
+		g_coopUiLeaveWanted = false; // every future join starts clean
+	}
+	// The thread never leaves: it is one parked cond wait for the process
+	// lifetime, which is cheaper than re-attaching a JVM thread per join.
+}
+
+std::thread g_coopUiService;
+std::once_flag g_coopUiServiceOnce;
+
+void ensureUiService() {
+	// Detached like the self-test thread: the process exits, it ends.
+	// (Declaration above; this is the definition.)
+	std::call_once(g_coopUiServiceOnce, [] { g_coopUiService = std::thread(serviceThread); });
+}
+
 } // namespace
+
+// The VR thread's two entry points, and the state it draws. Defined at Coop
+// scope because the header promises external linkage; everything they touch
+// lives in the file-local block above.
+
+std::atomic<int> g_coopUiState(kUiIdle);
+std::atomic<bool> g_coopUiLeaveWanted(false);
+char g_coopUiStatus[96] = "";
+char g_coopUiRoomLine[64] = "";
+std::atomic<unsigned> g_coopUiNoticeSeq(0);
+char g_coopUiNotice[96] = "";
+
+void requestLeaveRoom() { g_coopUiLeaveWanted = true; }
+
+void requestJoinRoom(const char *code, const char *invite) {
+	ensureUiService(); // starts the listener on first use, from the VR thread
+	std::lock_guard<std::mutex> lock(g_coopUiReq.mutex);
+	g_coopUiReq.create = false; // a join can follow a create on the same struct
+	g_coopUiReq.pending = true;
+	strncpy(g_coopUiReq.code, code, sizeof(g_coopUiReq.code) - 1);
+	g_coopUiReq.code[sizeof(g_coopUiReq.code) - 1] = 0;
+	strncpy(g_coopUiReq.invite, invite, sizeof(g_coopUiReq.invite) - 1);
+	g_coopUiReq.invite[sizeof(g_coopUiReq.invite) - 1] = 0;
+	g_coopUiReq.cond.notify_all();
+}
+
+void requestCreateRoom(const char *name) {
+	ensureUiService();
+	std::lock_guard<std::mutex> lock(g_coopUiReq.mutex);
+	g_coopUiReq.create = true;
+	g_coopUiReq.pending = true;
+	strncpy(g_coopUiReq.code, name, sizeof(g_coopUiReq.code) - 1);
+	g_coopUiReq.code[sizeof(g_coopUiReq.code) - 1] = 0;
+	g_coopUiReq.invite[0] = 0; // an open room needs no credential to join
+	g_coopUiReq.cond.notify_all();
+}
 
 // The render hand-off. Defined here (inside namespace Coop, outside the
 // file-local one) because the producer side belongs with whoever drives the

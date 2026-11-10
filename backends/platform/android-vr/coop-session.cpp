@@ -74,7 +74,10 @@ bool isRoomCode(const char *code) {
 		if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')))
 			return false;
 	}
-	return len >= 4 && len <= Wire::kMaxRoomCodeLen;
+	// 1..20: generated codes are 5; a host-chosen name can be anything from
+	// "A" to the relay's 20-character cap. The relay is authoritative on
+	// shape (isValidRoomName); this only keeps a malformed string off the wire.
+	return len >= 1 && len <= Wire::kMaxRoomCodeLen;
 }
 
 } // namespace
@@ -132,21 +135,45 @@ Common::String Session::baseUrl() const {
 	return _baseUrl;
 }
 
-bool Session::createRoom(const char *ownerName) {
+bool Session::createRoom(const char *ownerName, bool openRoom, const char *customName) {
+	const bool named = customName && customName[0];
+	if (openRoom && named) {
+		const Field fields[] = {
+			{ "ownerName", ownerName ? ownerName : "host" },
+			{ "open", "true" }, { "name", customName } };
+		return post("/rooms", fields, 3, 'h');
+	}
+	if (named) {
+		const Field fields[] = {
+			{ "ownerName", ownerName ? ownerName : "host" }, { "name", customName } };
+		return post("/rooms", fields, 2, 'h');
+	}
+	if (openRoom) {
+		// Code-only join: guests need nothing but the room code. The relay
+		// still mints an invite; it simply does not demand it.
+		const Field fields[] = { { "ownerName", ownerName ? ownerName : "host" }, { "open", "true" } };
+		return post("/rooms", fields, 2, 'h');
+	}
 	const Field fields[] = { { "ownerName", ownerName ? ownerName : "host" } };
 	return post("/rooms", fields, 1, 'h');
 }
 
 bool Session::joinRoom(const char *code, const char *invite) {
-	if (!isRoomCode(code) || !invite || !invite[0])
+	if (!isRoomCode(code))
 		return false;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		copyText(Common::String(code), _requestedCode, sizeof(_requestedCode));
 	}
 	const Common::String path = "/rooms/" + Common::String(code) + "/sessions";
-	const Field fields[] = { { "role", "guest" }, { "secret", invite } };
-	return post(path.c_str(), fields, 2, 'g');
+	// An empty invite asks the relay to admit us on the code alone; the relay
+	// grants that only for an open room and answers invite_required otherwise.
+	if (invite && invite[0]) {
+		const Field fields[] = { { "role", "guest" }, { "secret", invite } };
+		return post(path.c_str(), fields, 2, 'g');
+	}
+	const Field fields[] = { { "role", "guest" } };
+	return post(path.c_str(), fields, 1, 'g');
 }
 
 bool Session::closeRoom(const char *code, const char *ownerSecret) {

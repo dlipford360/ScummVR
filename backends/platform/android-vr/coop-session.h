@@ -100,8 +100,8 @@ public:
 	void setBaseUrl(const Common::String &baseUrl);
 	Common::String baseUrl() const;
 
-	bool createRoom(const char *ownerName);
-	bool joinRoom(const char *code, const char *invite);
+	bool createRoom(const char *ownerName, bool openRoom = false, const char *customName = nullptr);
+	bool joinRoom(const char *code, const char *invite); // invite may be empty for an open room
 	bool closeRoom(const char *code, const char *ownerSecret);
 
 	bool pending() const;

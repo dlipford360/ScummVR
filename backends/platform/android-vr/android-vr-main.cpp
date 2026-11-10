@@ -34,8 +34,10 @@
 #include <android/asset_manager_jni.h>
 #include <sys/stat.h>
 #include <cstdio>
+#include <chrono>
 #include <string>
 #include <cstring>
+#include <cctype>
 #include <vector>
 #include <cmath>
 #include <pthread.h>
@@ -55,6 +57,7 @@
 #include "backends/platform/android-vr/coop-selftest.h"
 #include "backends/platform/android-vr/coop-video-display.h"
 #include "backends/platform/android-vr/coop-cursor.h"
+#include "backends/platform/android-vr/coop-interactive.h"
 
 #define LOG_TAG "ScummVM_VR_Main"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -114,7 +117,7 @@ static const char *kScreenFragYUV =
 
 // Floating UI buttons shown around the virtual screen (see initUIButtons)
 struct UIButtonDesc { float cx, cy, hw, hh; };
-enum { kBtnMenu = 0, kBtnZoomIn, kBtnZoomOut, kBtnCount };
+enum { kBtnJoin = 0, kBtnCreate, kBtnLeave, kBtnMenu, kBtnZoomIn, kBtnZoomOut, kBtnCount };
 
 struct VRApp {
 	android_app *app;
@@ -187,6 +190,30 @@ struct VRApp {
 	float rayHitX, rayHitY;
 	bool rayHitValid;
 	GLuint testTexture;
+
+	// Interactive coop UI (coop-interactive.h): the JOIN ROOM / LEAVE ROOM
+	// buttons and the gaze keyboard panel. kbVisible is VR-thread-only state;
+	// kbBaked* mirror what the panel texture currently shows so it is re-baked
+	// on change, not per frame.
+	GLuint kbTex, kbVBO;
+	bool kbVisible;
+	bool kbCreateMode; // keyboard types a new room name, not a join code
+	bool kbBakedCreateMode; // the mode kbTex currently shows, for re-bake detection
+	int kbHover;
+	char kbTyped[48];
+	char kbHint[48]; // local validation feedback, shown in place of the status
+	char kbBakedTyped[48], kbBakedStatus[96], kbBakedRoom[64];
+	float kbHitX, kbHitY; // ray ∩ keyboard plane (kKbZ), panel-local frame
+	bool kbHitValid;      // inside the panel's extent
+
+	// One-shot notices from the service thread ("HOST LEFT THE ROOM"). The
+	// service bumps g_coopUiNoticeSeq with the text; this thread bakes on
+	// the edge, shows the band for a few seconds, fades over the last one.
+	// All VR-thread state - the service never touches it.
+	GLuint toastTex, toastVBO;
+	unsigned toastSeq;
+	int64 toastUntilMs; // steady clock; 0 while nothing is showing
+	char toastShown[96];
 
 	// Controller input
 	XrActionSet actionSet;
@@ -667,6 +694,314 @@ static void drawScreen(VRApp *a, const float *viewProj) {
 	glUseProgram(0);
 }
 
+// ---- Text in the floating UI ----
+// The VR backend has no text renderer (the existing buttons are procedural
+// glyphs), so labels come from a bitmap font baked into the same procedural
+// panel textures. 5x7, not 3x5: the first version used 3x5 and 'A' (rows
+// ###/.#./###/.#./###) read as an E - at headset distance three columns
+// cannot carry a letter. The classic 5x7 set below is unambiguous.
+struct Glyph5x7 { uint8_t rows[7]; }; // bit 4 = left pixel
+static const Glyph5x7 kFont5x7[] = {
+	{{0,0,0,0,0,0,0}},                      // ' ' (also unmapped chars)
+	{{0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}}, // A
+	{{0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}}, // B
+	{{0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}}, // C
+	{{0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}}, // D
+	{{0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}}, // E
+	{{0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}}, // F
+	{{0x0E,0x11,0x10,0x17,0x11,0x11,0x0F}}, // G
+	{{0x11,0x11,0x11,0x1F,0x11,0x11,0x11}}, // H
+	{{0x0E,0x04,0x04,0x04,0x04,0x04,0x0E}}, // I
+	{{0x07,0x02,0x02,0x02,0x02,0x12,0x0C}}, // J
+	{{0x11,0x12,0x14,0x18,0x14,0x12,0x11}}, // K
+	{{0x10,0x10,0x10,0x10,0x10,0x10,0x1F}}, // L
+	{{0x11,0x1B,0x15,0x15,0x11,0x11,0x11}}, // M
+	{{0x11,0x19,0x15,0x13,0x11,0x11,0x11}}, // N
+	{{0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}}, // O
+	{{0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}}, // P
+	{{0x0E,0x11,0x11,0x11,0x15,0x12,0x0D}}, // Q
+	{{0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}}, // R
+	{{0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}}, // S
+	{{0x1F,0x04,0x04,0x04,0x04,0x04,0x04}}, // T
+	{{0x11,0x11,0x11,0x11,0x11,0x11,0x0E}}, // U
+	{{0x11,0x11,0x11,0x11,0x11,0x0A,0x04}}, // V
+	{{0x11,0x11,0x11,0x15,0x15,0x1B,0x11}}, // W
+	{{0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}}, // X
+	{{0x11,0x11,0x0A,0x04,0x04,0x04,0x04}}, // Y
+	{{0x1F,0x01,0x02,0x04,0x08,0x10,0x1F}}, // Z
+	{{0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}}, // 0
+	{{0x0C,0x0A,0x04,0x04,0x04,0x04,0x0E}}, // 1
+	{{0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}}, // 2
+	{{0x1F,0x02,0x04,0x02,0x01,0x11,0x0E}}, // 3
+	{{0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}}, // 4
+	{{0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}}, // 5
+	{{0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}}, // 6
+	{{0x1F,0x01,0x02,0x04,0x08,0x08,0x08}}, // 7
+	{{0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}}, // 8
+	{{0x0E,0x11,0x11,0x0F,0x01,0x02,0x1C}}, // 9
+	{{0,0x04,0x04,0,0x04,0x04,0}},          // :
+	{{0,0,0,0x1F,0,0,0}},                   // dash
+	{{0,0,0x1F,0,0x1F,0,0}},                // =
+	{{0x01,0x02,0x02,0x04,0x08,0x08,0x10}}, // /
+	{{0,0,0,0,0,0x04,0}},                   // .
+	{{0,0,0,0,0,0,0x1F}},                   // _ (service strings: invite_required)
+};
+static const Glyph5x7 *glyphFor(char c) {
+	if (c >= 'A' && c <= 'Z') return &kFont5x7[c - 'A' + 1];
+	if (c >= 'a' && c <= 'z') return &kFont5x7[c - 'a' + 1];
+	if (c >= '0' && c <= '9') return &kFont5x7[c - '0' + 27];
+	switch (c) {
+	case ' ': return &kFont5x7[0];
+	case ':': return &kFont5x7[37];
+	case '-': return &kFont5x7[38];
+	case '=': return &kFont5x7[39];
+	case '/': return &kFont5x7[40];
+	case '.': return &kFont5x7[41];
+	case '_': return &kFont5x7[42];
+	default:  return &kFont5x7[0];
+	}
+}
+// Rendered width of a string at a pixel scale (6 px advance per glyph cell,
+// minus the trailing gap column). Used to centre labels in their keys.
+static int textWidth(const char *s, int scale) {
+	return s[0] ? (int)strlen(s) * 6 * scale - scale : 0;
+}
+
+// Panel pixels: everything the floating UI draws is baked on the CPU into an
+// RGBA buffer with a rounded dark panel and an orange border, the same look
+// as the existing icon buttons. The pixels are heap (std::vector): a PanelBuf
+// is ~2.3 MB, and the first version of this put several on the stack at once,
+// which the VR thread's stack did not appreciate (native crash on launch,
+// observed on a Quest 3 in minutes).
+struct PanelBuf {
+	static const int W = 1024, H = 560;
+	std::vector<uint8_t> px;
+	PanelBuf() : px((size_t)W * H * 4, 0) {}
+	void panel(int x, int y, int w, int h, int r) {
+		for (int py = y; py < y + h; py++) {
+			for (int pxx = x; pxx < x + w; pxx++) {
+				float dx = fabsf(pxx + 0.5f - (x + w / 2.0f)) - (w / 2.0f - r);
+				float dy = fabsf(py + 0.5f - (y + h / 2.0f)) - (h / 2.0f - r);
+				float d = sqrtf(fmaxf(dx, 0.f) * fmaxf(dx, 0.f) +
+				                fmaxf(dy, 0.f) * fmaxf(dy, 0.f)) +
+				          fminf(fmaxf(dx, dy), 0.f);
+				if (d > 0.f) continue;
+				uint8_t *p = &px[(size_t)(py * W + pxx) * 4];
+				if (d > -4.f) { p[0] = 255; p[1] = 150; p[2] = 60; }
+				else          { p[0] = 38;  p[1] = 38;  p[2] = 48;  }
+				p[3] = 240;
+			}
+		}
+	}
+	void text(const char *s, int x, int y, int scale, uint8_t R, uint8_t G, uint8_t B) {
+		for (; *s; s++) {
+			const Glyph5x7 *g = glyphFor(*s);
+			for (int row = 0; row < 7; row++)
+				for (int col = 0; col < 5; col++) {
+					if (!(g->rows[row] & (1 << (4 - col)))) continue;
+					for (int sy = 0; sy < scale; sy++)
+						for (int sx = 0; sx < scale; sx++) {
+							int pxp = x + col * scale + sx, pyp = y + row * scale + sy;
+							if (pxp < 0 || pxp >= W || pyp < 0 || pyp >= H) continue;
+							uint8_t *p = &px[(size_t)(pyp * W + pxp) * 4];
+							p[0] = R; p[1] = G; p[2] = B; p[3] = 255;
+						}
+				}
+			x += 6 * scale;
+		}
+	}
+};
+// glTexImage2D takes row 0 first, and the button VBO maps v=0 to each quad's
+// BOTTOM edge - so label text baked top-down would render upside down. The
+// icon glyphs were symmetric and never noticed; text must upload flipped.
+static void uploadPanelTexture(GLuint tex, const PanelBuf &buf, bool flipRows) {
+	std::vector<uint8_t> flipped;
+	const uint8_t *src = buf.px.data();
+	if (flipRows) {
+		flipped.resize(buf.px.size());
+		const size_t row = (size_t)PanelBuf::W * 4;
+		for (int y = 0; y < PanelBuf::H; y++)
+			memcpy(&flipped[(size_t)y * row], &buf.px[(size_t)(PanelBuf::H - 1 - y) * row], row);
+		src = flipped.data();
+	}
+	glBindTexture(GL_TEXTURE_2D, tex);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, PanelBuf::W, PanelBuf::H, 0,
+		GL_RGBA, GL_UNSIGNED_BYTE, src);
+	glBindTexture(GL_TEXTURE_2D, 0);
+}
+static GLuint makePanelTexture(const PanelBuf &buf, bool flipRows) {
+	GLuint tex;
+	glGenTextures(1, &tex);
+	glBindTexture(GL_TEXTURE_2D, tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	uploadPanelTexture(tex, buf, flipRows);
+	return tex;
+}
+
+// ---- Join-room keyboard geometry ----
+// The panel is fixed size and position (z = -2.5 like everything else),
+// independent of the screen scale: typing at a shrunken screen would just
+// make keys harder to hit. Rows: 10 + 9 + 7 letters, then 9 digits, then
+// SPACE DEL CLR SUBMIT. kKeyByIdx drives both the baked labels and the hit
+// test, so the texture and the clickable rects can never disagree.
+static const int kKbTexW = PanelBuf::W, kKbTexH = PanelBuf::H;
+static const float kKbWorldW = 1.70f, kKbWorldH = kKbWorldW * kKbTexH / kKbTexW;
+static const float kKbHalfW = kKbWorldW / 2.0f, kKbHalfH = kKbWorldH / 2.0f;
+// The panel floats in FRONT of the screen plane and slightly below centre:
+// overlapping the game video coplanarly read as a glitch, and 0.3 m of
+// parallax plus a depth test against the screen quad make it unmistakably a
+// separate surface. Keys are hit-tested against THIS plane (see processInput).
+static const float kKbZ = -2.20f, kKbCY = -0.10f;
+#define KB_X2W(px) ((float)(px) / kKbTexW * 2.0f * kKbHalfW - kKbHalfW)
+#define KB_Y2W(py) (kKbHalfH - (float)(py) / kKbTexH * 2.0f * kKbHalfH)
+
+static const char *const kKbRows[4] = { "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM", "0123456789" };
+// Pitch 80 (64 px key + 16 gap). The action row then clears the digits row
+// entirely - the first layout had them overlapping, so the action keys'
+// bottom third was both visually crushed and unreachable to the hit test.
+static const int kKbRowY[4] = { 180, 260, 340, 420 };
+static const int kKbKeyW = 84, kKbKeyH = 64, kKbKeyGap = 14;
+// Action row: same pitch and width, taller keys so the SPACE/DEL/CLR/SUBMIT
+// labels get real padding inside the border instead of kissing it.
+static const int kKbActionY = 496, kKbActionH = kKbKeyH - 12;
+static const int kKbRowTotalW = 10 * (kKbKeyW + kKbKeyGap) - kKbKeyGap; // the digits row spans this
+enum { kKeySpace = 128, kKeyDel, kKeyClr, kKeySubmit };
+static const char *const kKbRow4Acts[3] = { "SPACE", "DEL", "CLR" }; // after the digits
+
+struct KbKeyRect { float cx, cy, hw, hh; int id; }; // id: char or kKey*
+static KbKeyRect g_kbKeys[48];
+static int g_kbKeyCount = 0;
+
+static void layoutKeyboard() {
+	g_kbKeyCount = 0;
+	auto rowWidth = [](const char *s) {
+		return (int)strlen(s) * (kKbKeyW + kKbKeyGap) - kKbKeyGap;
+	};
+	for (int r = 0; r < 4; r++) {
+		int x = (kKbTexW - rowWidth(kKbRows[r])) / 2;
+		for (const char *s = kKbRows[r]; *s; s++, x += kKbKeyW + kKbKeyGap) {
+			g_kbKeys[g_kbKeyCount++] = {
+				KB_X2W(x + kKbKeyW / 2), kKbCY + KB_Y2W(kKbRowY[r] + kKbKeyH / 2),
+				(float)kKbKeyW / 2 / kKbTexW * 2 * kKbHalfW,
+				(float)kKbKeyH / 2 / kKbTexH * 2 * kKbHalfH, (int)*s };
+		}
+	}
+	// Action row: two-column keys for SPACE/DEL/CLR, SUBMIT takes the rest -
+	// must agree with bakeKeyboard exactly, or labels and hit boxes diverge.
+	int x = (kKbTexW - kKbRowTotalW) / 2;
+	const int aw = 2 * kKbKeyW + kKbKeyGap;
+	const int ids[3] = { kKeySpace, kKeyDel, kKeyClr };
+	for (int i = 0; i < 3; i++, x += aw + kKbKeyGap) {
+		g_kbKeys[g_kbKeyCount++] = {
+			KB_X2W(x + aw / 2), kKbCY + KB_Y2W(kKbActionY + kKbActionH / 2),
+			(float)aw / 2 / kKbTexW * 2 * kKbHalfW,
+			(float)kKbActionH / 2 / kKbTexH * 2 * kKbHalfH, ids[i] };
+	}
+	int w = (kKbTexW + kKbRowTotalW) / 2 - x;
+	g_kbKeys[g_kbKeyCount++] = {
+		KB_X2W(x + w / 2), kKbCY + KB_Y2W(kKbActionY + kKbActionH / 2),
+		(float)w / 2 / kKbTexW * 2 * kKbHalfW,
+		(float)kKbActionH / 2 / kKbTexH * 2 * kKbHalfH, kKeySubmit };
+}
+
+// Bake the keyboard panel: title, typed field with caret, service status,
+// and every key label. Called when any of those change, not per frame.
+static void bakeKeyboard(PanelBuf &buf, const char *typed, const char *status,
+		const char *roomLine, bool createMode) {
+	buf.panel(0, 0, kKbTexW, kKbTexH, 28);
+	// Same panel, two jobs: join types an existing room's name, create types
+	// a new one. Only the header and the idle line differ - the keyboard is
+	// identical because it must be.
+	buf.text(createMode ? "NAME YOUR ROOM" : "ENTER ROOM CODE", 56, 18, 4, 255, 190, 110);
+	buf.panel(40, 84, kKbTexW - 80, 64, 10);
+	buf.text(typed, 56, 95, 6, 255, 255, 255);
+	// caret after the last glyph (6 px cell advance at scale 6)
+	const int caretX = 56 + (int)strlen(typed) * 6 * 6 + 2;
+	for (int sy = 0; sy < 44; sy++) {
+		int pyp = 93 + sy;
+		if (caretX >= 0 && caretX < kKbTexW) {
+			uint8_t *p = &buf.px[(size_t)(pyp * kKbTexW + caretX) * 4];
+			p[0] = 255; p[1] = 190; p[2] = 110; p[3] = 255;
+		}
+	}
+	buf.text(status[0] ? status
+			: (roomLine[0] ? roomLine : (createMode ? "UP TO 20 LETTERS OR DIGITS" : "IDLE")),
+		56, 152, 3, 160, 230, 160);
+	for (int r = 0; r < 4; r++) {
+		int x = (kKbTexW - ((int)strlen(kKbRows[r]) * (kKbKeyW + kKbKeyGap) - kKbKeyGap)) / 2;
+		for (const char *s = kKbRows[r]; *s; s++, x += kKbKeyW + kKbKeyGap) {
+			buf.panel(x, kKbRowY[r], kKbKeyW, kKbKeyH, 8);
+			char one[2] = { *s, 0 };
+			buf.text(one, x + (kKbKeyW - 5 * 5) / 2, kKbRowY[r] + (kKbKeyH - 7 * 5) / 2,
+				5, 245, 245, 240);
+		}
+	}
+	// Action row: SPACE/DEL/CLR each own a two-column key so their labels fit
+	// the 5x7 font; SUBMIT takes the remainder. layoutKeyboard mirrors this.
+	int x = (kKbTexW - kKbRowTotalW) / 2;
+	const int aw = 2 * kKbKeyW + kKbKeyGap;
+	for (int i = 0; i < 3; i++, x += aw + kKbKeyGap) {
+		buf.panel(x, kKbActionY, aw, kKbActionH, 8);
+		buf.text(kKbRow4Acts[i], x + (aw - textWidth(kKbRow4Acts[i], 4)) / 2,
+			kKbActionY + (kKbActionH - 7 * 4) / 2, 4, 245, 245, 240);
+	}
+	int w = (kKbTexW + kKbRowTotalW) / 2 - x;
+	buf.panel(x, kKbActionY, w, kKbActionH, 8);
+	buf.text("SUBMIT", x + (w - textWidth("SUBMIT", 4)) / 2, kKbActionY + (kKbActionH - 7 * 4) / 2,
+		4, 255, 200, 120);
+}
+
+// A service notice is one line of at most ~30 glyphs; the bake shrinks the
+// scale until it fits the canvas, so the message always lands whole.
+static void bakeToast(PanelBuf &buf, const char *msg) {
+	int scale = 8;
+	while (scale > 3 && textWidth(msg, scale) > kKbTexW - 48)
+		scale--;
+	const int bandH = 7 * scale + 32;
+	const int y0 = (kKbTexH - bandH) / 2;
+	buf.panel(0, y0, kKbTexW, bandH, 24);
+	buf.text(msg, (kKbTexW - textWidth(msg, scale)) / 2, y0 + 16, scale, 255, 236, 210);
+}
+
+// A monotonic clock for UI lifetimes (toast fade). Steady, never wall: a
+// headset time adjustment must not freeze or skip a fading toast.
+static int64 vrNowMs() {
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Text button labels bake through the same PanelBuf. Words stack one per
+// line ("JOIN" over "ROOM"): a two-word line squashed across a wide quad
+// reads poorly at headset distance, and stacked words let the button be
+// boxy instead of a letterbox.
+static void bakeLabel(PanelBuf &buf, const char *label, bool dim) {
+	buf.panel(32, 16, 960, 528, 24); // fill the canvas: the quad IS the panel
+	const uint8_t V = dim ? 130 : 245;
+	const int scale = 10;
+	int lines = 1;
+	for (const char *q = label; *q; q++)
+		if (*q == ' ')
+			lines++;
+	const int lineStep = 9 * scale; // 7 glyph rows + 2 rows of leading
+	int y = (PanelBuf::H - (lines * 7 * scale + (lines - 1) * 2 * scale)) / 2;
+	const char *p = label;
+	for (;;) {
+		char word[32];
+		int n = 0;
+		while (*p && *p != ' ' && n < (int)sizeof(word) - 1)
+			word[n++] = *p++;
+		word[n] = 0;
+		buf.text(word, (kKbTexW - textWidth(word, scale)) / 2, y, scale, V, V, V - 5);
+		if (!*p)
+			break;
+		p++; // step over the space
+		y += lineStep;
+	}
+}
+
 // ---- Floating UI buttons ----
 // Textured quads on the same plane as the virtual screen (z = -2.5), anchored
 // above its top edge so they float above the ScummVM display. Sharing the
@@ -680,15 +1015,25 @@ static const char *kUIButtonFrag =
 	"out vec4 color;\n"
 	"void main() { color = texture(tex, vUV) * tint; }\n";
 
-// Buttons stay pinned to the screen's top-left corner, so their world
-// position depends on the (user-scalable) screen half-extents.
+// Buttons stay pinned to the screen, so their world position depends on the
+// (user-scalable) screen half-extents. Icon buttons hug the top-left corner;
+// JOIN/LEAVE form a vertical column just right of the screen's right edge,
+// centred on its height - always visible beside the video, never covering it.
 static void updateUIButtonLayout(VRApp *a) {
 	const float gapAbove = 0.16f; // above the screen's top edge
+	const float y = a->screenHH + gapAbove;
 	const float startX = -a->screenHW + 0.24f;
 	const float stepX = 0.46f;
-	a->uiDesc[kBtnMenu]   = { startX,               a->screenHH + gapAbove, 0.20f, 0.11f };
-	a->uiDesc[kBtnZoomIn] = { startX + stepX,       a->screenHH + gapAbove, 0.20f, 0.11f };
-	a->uiDesc[kBtnZoomOut]= { startX + 2.0f * stepX, a->screenHH + gapAbove, 0.20f, 0.11f };
+	a->uiDesc[kBtnMenu]    = { startX,                y, 0.20f, 0.11f };
+	a->uiDesc[kBtnZoomIn]  = { startX + stepX,        y, 0.20f, 0.11f };
+	a->uiDesc[kBtnZoomOut] = { startX + 2.0f * stepX, y, 0.20f, 0.11f };
+	// Boxy buttons (0.52 x 0.34 m) carrying two stacked words, in a column
+	// down the screen's right edge: CREATE on top (idle), JOIN next (idle),
+	// LEAVE last (in-room) - top-to-bottom matches the order they go live.
+	const float rightCol = a->screenHW + 0.10f + 0.26f;
+	a->uiDesc[kBtnCreate] = { rightCol,  0.39f, 0.26f, 0.17f };
+	a->uiDesc[kBtnJoin]   = { rightCol,  0.00f, 0.26f, 0.17f };
+	a->uiDesc[kBtnLeave]  = { rightCol, -0.39f, 0.26f, 0.17f };
 }
 
 // Re-upload button quad positions after a screen scale change
@@ -831,6 +1176,42 @@ static void initUIButtons(VRApp *a) {
 	a->uiTexIds[kBtnMenu]    = makeIconTexture(kBtnMenu);
 	a->uiTexIds[kBtnZoomIn]  = makeIconTexture(kBtnZoomIn);
 	a->uiTexIds[kBtnZoomOut] = makeIconTexture(kBtnZoomOut);
+	{
+		PanelBuf b;
+		// flipRows: the button VBO maps v=0 to the bottom edge, so text must
+		// upload upside-down to bake upright (icons are symmetric, didn't care)
+		bakeLabel(b, "CREATE ROOM", false);
+		a->uiTexIds[kBtnCreate] = makePanelTexture(b, true);
+		bakeLabel(b, "JOIN ROOM", false);
+		a->uiTexIds[kBtnJoin] = makePanelTexture(b, true);
+		bakeLabel(b, "LEAVE ROOM", false);
+		a->uiTexIds[kBtnLeave] = makePanelTexture(b, true);
+	}
+
+	// Keyboard panel: fixed geometry, baked once; re-baked when the typed
+	// string or the service status changes (see drawKbPanel). This quad maps
+	// v=0 to the top edge like the video screen, so its texture uploads plain.
+	layoutKeyboard();
+	PanelBuf kbBuf;
+	bakeKeyboard(kbBuf, "", "", "", false);
+	a->kbTex = makePanelTexture(kbBuf, false);
+	a->kbVisible = false;
+	a->kbCreateMode = false;
+	a->kbBakedCreateMode = false;
+	a->kbHover = -1;
+	a->kbTyped[0] = 0;
+	a->kbHint[0] = 0;
+	a->kbBakedTyped[0] = a->kbBakedStatus[0] = a->kbBakedRoom[0] = 0;
+	float kbVerts[4][5] = {
+		{ -kKbHalfW, kKbCY - kKbHalfH, kKbZ, 0, 1 },
+		{  kKbHalfW, kKbCY - kKbHalfH, kKbZ, 1, 1 },
+		{ -kKbHalfW, kKbCY + kKbHalfH, kKbZ, 0, 0 },
+		{  kKbHalfW, kKbCY + kKbHalfH, kKbZ, 1, 0 },
+	};
+	glGenBuffers(1, &a->kbVBO);
+	glBindBuffer(GL_ARRAY_BUFFER, a->kbVBO);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(kbVerts), kbVerts, GL_STATIC_DRAW);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
 
 	// One triangle-strip quad per button (pos3 + uv2, like the screen quad);
 	// positions are rebuilt whenever the screen is scaled
@@ -845,11 +1226,99 @@ static void initUIButtons(VRApp *a) {
 	glGenBuffers(1, &a->uiCursorVBO);
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 
+	// Service notices: a band that hangs under the screen's bottom edge for
+	// a few seconds. Texture baked on demand, VBO rebuilt like the dot.
+	{
+		PanelBuf blank;
+		bakeToast(blank, "");
+		a->toastTex = makePanelTexture(blank, true);
+	}
+	glGenBuffers(1, &a->toastVBO);
+	a->toastSeq = 0;
+	a->toastUntilMs = 0;
+	a->toastShown[0] = 0;
+
 	a->uiHover = -1;
 	a->uiClickAbsorbed = false;
 	a->rayHitValid = false;
 	a->rayHitX = a->rayHitY = 0;
 	LOGI("Floating UI buttons initialized");
+}
+
+// The two text buttons gate on live service state, and a disabled button is
+// not a hover target either: the ray then paints the pointer dot and, on the
+// screen rect, drives the game as usual.
+static bool joinButtonEnabled(VRApp *a) {
+	return !a->kbVisible && Coop::g_coopUiState == Coop::kUiIdle;
+}
+// Same gate as JOIN - both act on an idle device - the two just ask the
+// service for opposite roles.
+static bool createButtonEnabled(VRApp *a) {
+	return joinButtonEnabled(a);
+}
+static bool leaveButtonEnabled(VRApp *a) {
+	return Coop::g_coopUiState != Coop::kUiIdle;
+}
+
+// Keyboard panel + hovered-key highlight. Called from drawUIButtons before
+// the pointer dot so the dot stays on top of the panel while typing.
+static void drawKbPanel(VRApp *a) {
+	if (!a->kbVisible)
+		return;
+	// SUBMIT took effect (or the service moved on): close the panel.
+	if (Coop::g_coopUiState != Coop::kUiIdle) {
+		a->kbVisible = false;
+		return;
+	}
+	const char *shown = a->kbHint[0] ? a->kbHint : Coop::g_coopUiStatus;
+	if (a->kbCreateMode != a->kbBakedCreateMode ||
+		strcmp(a->kbTyped, a->kbBakedTyped) || strcmp(shown, a->kbBakedStatus) ||
+		strcmp(Coop::g_coopUiRoomLine, a->kbBakedRoom)) {
+		PanelBuf buf;
+		bakeKeyboard(buf, a->kbTyped, shown, Coop::g_coopUiRoomLine, a->kbCreateMode);
+		uploadPanelTexture(a->kbTex, buf, false);
+		a->kbBakedCreateMode = a->kbCreateMode;
+		strncpy(a->kbBakedTyped, a->kbTyped, sizeof(a->kbBakedTyped) - 1);
+		a->kbBakedTyped[sizeof(a->kbBakedTyped) - 1] = 0;
+		strncpy(a->kbBakedStatus, shown, sizeof(a->kbBakedStatus) - 1);
+		a->kbBakedStatus[sizeof(a->kbBakedStatus) - 1] = 0;
+		strncpy(a->kbBakedRoom, Coop::g_coopUiRoomLine, sizeof(a->kbBakedRoom) - 1);
+		a->kbBakedRoom[sizeof(a->kbBakedRoom) - 1] = 0;
+	}
+
+	// NOTE on attribute pointers: glVertexAttribPointer captures the buffer
+	// bound AT THE CALL, so anything that changes the binding or the pointers
+	// must re-establish them before its own draws. This function is therefore
+	// called AFTER the button loop, never before it - the first version was
+	// not, and the button loop went on to draw from the panel's VBO: the
+	// "flashing garbage over the screen" bug.
+	glBindBuffer(GL_ARRAY_BUFFER, a->kbVBO);
+	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 20, (void*)0);
+	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 20, (void*)12);
+	float tint[4] = {1, 1, 1, 1};
+	glUniform4fv(a->uiTintLoc, 1, tint);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, a->kbTex);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+	if (a->kbHover >= 0 && a->kbHover < g_kbKeyCount) {
+		const KbKeyRect &k = g_kbKeys[a->kbHover];
+		// Translucent orange wash over the key: white base texture x tint.
+		float ov[4][5] = {
+			{ k.cx - k.hw, k.cy - k.hh, kKbZ + 0.002f, 0, 0 },
+			{ k.cx + k.hw, k.cy - k.hh, kKbZ + 0.002f, 1, 0 },
+			{ k.cx - k.hw, k.cy + k.hh, kKbZ + 0.002f, 0, 1 },
+			{ k.cx + k.hw, k.cy + k.hh, kKbZ + 0.002f, 1, 1 },
+		};
+		float ot[4] = {1.0f, 0.62f, 0.25f, 0.45f};
+		glUniform4fv(a->uiTintLoc, 1, ot);
+		glBindBuffer(GL_ARRAY_BUFFER, a->uiCursorVBO);
+		glBufferData(GL_ARRAY_BUFFER, sizeof(ov), ov, GL_DYNAMIC_DRAW);
+		glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 20, (void*)0);
+		glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 20, (void*)12);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		glUniform4fv(a->uiTintLoc, 1, tint);
+	}
 }
 
 static void drawUIButtons(VRApp *a, const float *viewProj) {
@@ -869,7 +1338,12 @@ static void drawUIButtons(VRApp *a, const float *viewProj) {
 
 	for (int b = 0; b < kBtnCount; b++) {
 		float tint[4] = {1, 1, 1, 1};
-		if (a->uiHover == b)
+		const bool disabled = (b == kBtnJoin && !joinButtonEnabled(a)) ||
+		                      (b == kBtnCreate && !createButtonEnabled(a)) ||
+		                      (b == kBtnLeave && !leaveButtonEnabled(a));
+		if (disabled)
+			tint[0] = tint[1] = tint[2] = 0.45f; // dim: not available right now
+		else if (a->uiHover == b)
 			tint[0] = tint[1] = tint[2] = 1.5f; // hover highlight
 		glUniform4fv(a->uiTintLoc, 1, tint);
 		glActiveTexture(GL_TEXTURE0);
@@ -877,19 +1351,66 @@ static void drawUIButtons(VRApp *a, const float *viewProj) {
 		glDrawArrays(GL_TRIANGLE_STRIP, b * 4, 4);
 	}
 
-	// VR-space pointer dot where the controller ray meets this plane; visible
-	// anywhere on the plane, including outside the game video rect
+	// AFTER the loop: drawKbPanel re-points the attribute arrays (see its
+	// note), and only the dot block below re-establishes them for itself.
+	drawKbPanel(a);
+
+	// Service notice band ("HOST LEFT THE ROOM"), centred under the screen's
+	// bottom edge - away from every button, and where the frozen video was.
+	// Full-canvas texture on a full-aspect quad, so the band inside it is
+	// undistorted; the transparent margins let the world show through.
+	if (Coop::g_coopUiNoticeSeq.load() != a->toastSeq) {
+		a->toastSeq = Coop::g_coopUiNoticeSeq.load();
+		strncpy(a->toastShown, Coop::g_coopUiNotice, sizeof(a->toastShown) - 1);
+		a->toastShown[sizeof(a->toastShown) - 1] = 0;
+		PanelBuf tb;
+		bakeToast(tb, a->toastShown);
+		uploadPanelTexture(a->toastTex, tb, true);
+		a->toastUntilMs = vrNowMs() + 5000;
+	}
+	if (a->toastUntilMs != 0) {
+		const int64 leftMs = a->toastUntilMs - vrNowMs();
+		if (leftMs <= 0) {
+			a->toastUntilMs = 0;
+		} else {
+			const float thw = 0.85f, thh = thw * kKbTexH / kKbTexW;
+			const float tcx = 0.0f, tcy = -a->screenHH - 0.16f - thh;
+			const float tverts[4][5] = {
+				{ tcx - thw, tcy - thh, -2.5f, 0, 0 },
+				{ tcx + thw, tcy - thh, -2.5f, 1, 0 },
+				{ tcx - thw, tcy + thh, -2.5f, 0, 1 },
+				{ tcx + thw, tcy + thh, -2.5f, 1, 1 },
+			};
+			float ttint[4] = { 1, 1, 1, leftMs < 1000 ? (float)leftMs / 1000.0f : 1.0f };
+			glUniform4fv(a->uiTintLoc, 1, ttint);
+			glBindBuffer(GL_ARRAY_BUFFER, a->toastVBO);
+			glBufferData(GL_ARRAY_BUFFER, sizeof(tverts), tverts, GL_DYNAMIC_DRAW);
+			glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 20, (void*)0);
+			glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 20, (void*)12);
+			glActiveTexture(GL_TEXTURE0);
+			glBindTexture(GL_TEXTURE_2D, a->toastTex);
+			glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		}
+	}
+
+	// VR-space pointer dot where the controller ray meets the panel plane
+	// while typing, else the screen plane; visible anywhere, including
+	// outside the game video rect
 	if (a->rayHitValid) {
+		float dotX = a->rayHitX, dotY = a->rayHitY, dotZ = -2.49f;
+		if (a->kbVisible && a->kbHitValid) {
+			dotX = a->kbHitX; dotY = a->kbHitY; dotZ = kKbZ + 0.01f;
+		}
 		const float cs = 0.045f; // quad half-size (dot itself is ~40% of it)
 		float cverts[4][5] = {
-			{ a->rayHitX - cs, a->rayHitY - cs, -2.5f, 0, 0 },
-			{ a->rayHitX + cs, a->rayHitY - cs, -2.5f, 1, 0 },
-			{ a->rayHitX - cs, a->rayHitY + cs, -2.5f, 0, 1 },
-			{ a->rayHitX + cs, a->rayHitY + cs, -2.5f, 1, 1 },
+			{ dotX - cs, dotY - cs, dotZ, 0, 0 },
+			{ dotX + cs, dotY - cs, dotZ, 1, 0 },
+			{ dotX - cs, dotY + cs, dotZ, 0, 1 },
+			{ dotX + cs, dotY + cs, dotZ, 1, 1 },
 		};
 		float ctint[4] = {1, 1, 1, 1};
-		if (a->uiHover >= 0) {
-			ctint[0] = 1.0f; ctint[1] = 0.55f; ctint[2] = 0.2f; // orange over a button
+		if (a->uiHover >= 0 || a->kbHover >= 0) {
+			ctint[0] = 1.0f; ctint[1] = 0.55f; ctint[2] = 0.2f; // orange over a target
 		}
 		glUniform4fv(a->uiTintLoc, 1, ctint);
 		glBindBuffer(GL_ARRAY_BUFFER, a->uiCursorVBO);
@@ -973,19 +1494,145 @@ static void drawCoopCursors(VRApp *a, const float *viewProj) {
 	glUseProgram(0);
 }
 
-// Which floating button (if any) the ray-plane hit point falls inside
+// Which floating button (if any) the ray-plane hit point falls inside. A
+// disabled text button is deliberately not a target - the hover returns -1 so
+// the trigger reaches the game (or the dot) instead.
 static int uiButtonAt(VRApp *a, float hitX, float hitY) {
 	for (int b = 0; b < kBtnCount; b++) {
 		const UIButtonDesc &d = a->uiDesc[b];
 		if (hitX >= d.cx - d.hw && hitX <= d.cx + d.hw &&
-		    hitY >= d.cy - d.hh && hitY <= d.cy + d.hh)
+		    hitY >= d.cy - d.hh && hitY <= d.cy + d.hh) {
+			if (b == kBtnJoin && !joinButtonEnabled(a))
+				return -1;
+			if (b == kBtnCreate && !createButtonEnabled(a))
+				return -1;
+			if (b == kBtnLeave && !leaveButtonEnabled(a))
+				return -1;
 			return b;
+		}
 	}
 	return -1;
 }
 
+// Same question for the keyboard keys, while the panel is up.
+static int kbKeyAt(VRApp *a, float hitX, float hitY) {
+	if (!a->kbVisible)
+		return -1;
+	for (int i = 0; i < g_kbKeyCount; i++) {
+		const KbKeyRect &k = g_kbKeys[i];
+		if (hitX >= k.cx - k.hw && hitX <= k.cx + k.hw &&
+		    hitY >= k.cy - k.hh && hitY <= k.cy + k.hh)
+			return i;
+	}
+	return -1;
+}
+
+// SUBMIT accepts "NAME" (an open room's name - generated 5-char or a host-
+// chosen one up to 20) and the full form "NAME INVITE" (':' or '=' also
+// separate, the way the host's log prints them) for sealed rooms. The
+// invite is 32 hex, lower-cased on the way out. Name length is not
+// range-checked here beyond non-empty: the relay is authoritative on shape
+// and answers 404 for anything that does not exist.
+static bool parseRoomString(const char *typed, char *code, char *invite) {
+	char first[24], second[56];
+	int n = 0;
+	const char *s = typed;
+	while (*s && *s != ' ' && *s != ':' && *s != '=' && n < (int)sizeof(first) - 1)
+		first[n++] = *s++;
+	first[n] = 0;
+	while (*s == ' ' || *s == ':' || *s == '=')
+		s++;
+	int m = 0;
+	while (*s && m < (int)sizeof(second) - 1)
+		second[m++] = *s++;
+	second[m] = 0;
+
+	if (!first[0])
+		return false;
+	for (int i = 0; first[i]; i++)
+		if (!isalnum((unsigned char)first[i]))
+			return false;
+	strcpy(code, first);
+
+	if (!second[0]) { // code only: the relay decides open vs sealed
+		invite[0] = 0;
+		return true;
+	}
+	if (strlen(second) != 32)
+		return false;
+	for (int i = 0; i < 32; i++)
+		if (!isxdigit((unsigned char)second[i]))
+			return false;
+	for (int i = 0; i < 32; i++)
+		invite[i] = (char)tolower((unsigned char)second[i]);
+	invite[32] = 0;
+	return true;
+}
+
+static void pressKbKey(VRApp *a, int keyIdx) {
+	const int id = g_kbKeys[keyIdx].id;
+	const size_t len = strlen(a->kbTyped);
+	a->kbHint[0] = 0; // any edit clears the last validation complaint
+	if (id == kKeyDel) {
+		if (len)
+			a->kbTyped[len - 1] = 0;
+	} else if (id == kKeyClr) {
+		a->kbTyped[0] = 0;
+	} else if (id == kKeySpace) {
+		// SPACE separates "CODE INVITE"; a room name is [A-Z0-9], so in
+		// create mode the key has nothing to do and must not corrupt one.
+		if (!a->kbCreateMode && len && len < sizeof(a->kbTyped) - 2 && a->kbTyped[len - 1] != ' ')
+			strcat(a->kbTyped, " ");
+	} else if (id == kKeySubmit) {
+		if (a->kbCreateMode) {
+			// A room name is [A-Z0-9]{1,20} - the relay's isValidRoomName,
+			// mirrored so a bad name gets told here instead of by a 400
+			// round-trip. The keyboard only emits those characters, so this
+			// mostly catches length and a stray leading SPACE.
+			const size_t n = strlen(a->kbTyped);
+			bool ok = n >= 1 && n <= 20;
+			for (size_t i = 0; ok && a->kbTyped[i]; i++)
+				ok = (a->kbTyped[i] >= 'A' && a->kbTyped[i] <= 'Z') ||
+				     (a->kbTyped[i] >= '0' && a->kbTyped[i] <= '9');
+			if (ok) {
+				Coop::requestCreateRoom(a->kbTyped);
+				a->kbTyped[0] = 0;
+				a->kbVisible = false; // the room line in the panel is the receipt
+			} else {
+				strncpy(a->kbHint, "1 TO 20 LETTERS OR DIGITS", sizeof(a->kbHint) - 1);
+				a->kbHint[sizeof(a->kbHint) - 1] = 0;
+			}
+			return;
+		}
+		char code[24], invite[64];
+		if (parseRoomString(a->kbTyped, code, invite)) {
+			Coop::requestJoinRoom(code, invite);
+			a->kbTyped[0] = 0;
+			a->kbVisible = false; // closing on the next frame is the join UI
+		} else {
+			strncpy(a->kbHint, "ROOM NAME IS 1 TO 20 CHARACTERS", sizeof(a->kbHint) - 1);
+			a->kbHint[sizeof(a->kbHint) - 1] = 0;
+		}
+	} else if (len < (a->kbCreateMode ? 20u : sizeof(a->kbTyped) - 1)) {
+		a->kbTyped[len] = (char)id; // the layout is uppercase-only
+		a->kbTyped[len + 1] = 0;
+	}
+}
+
 static void fireUIButton(VRApp *a, OSystem_Android *sys, int button) {
-	if (button == kBtnMenu) {
+	if (button == kBtnJoin) {
+		a->kbVisible = true;
+		a->kbCreateMode = false;
+		a->kbHint[0] = 0;
+	} else if (button == kBtnCreate) {
+		a->kbVisible = true;
+		a->kbCreateMode = true;
+		a->kbHint[0] = 0;
+		a->kbTyped[0] = 0; // never inherit a half-typed join string into a name
+	} else if (button == kBtnLeave) {
+		a->kbVisible = false;
+		Coop::requestLeaveRoom();
+	} else if (button == kBtnMenu) {
 		if (!sys) return;
 		// Global ScummVM menu, same as the Touch Menu button / desktop Ctrl+F1
 		Common::Event ev;
@@ -1085,6 +1732,27 @@ static void processInput(VRApp *a) {
 	float screenZ = -2.5f;
 	int hover = -1;
 	bool planeHit = false;
+	a->kbHover = -1;
+	a->kbHitValid = false;
+
+	// The keyboard panel floats in front of the screen (z = kKbZ), so while it
+	// is up its keys are hit-tested against THEIR plane - projecting them onto
+	// the screen plane instead mis-aims every key, worse the further off-axis
+	// the ray lands. Inside the panel's extent, clicks never reach the game.
+	if (a->kbVisible && fabsf(dirZ) > 1e-6f) {
+		float tk = (kKbZ - pose.position.z) / dirZ;
+		if (tk > 0) {
+			const float kx = pose.position.x + tk * dirX;
+			const float ky = pose.position.y + tk * dirY;
+			if (fabsf(kx) <= kKbHalfW && fabsf(ky - kKbCY) <= kKbHalfH) {
+				a->kbHitX = kx;
+				a->kbHitY = ky;
+				a->kbHitValid = true;
+				a->kbHover = kbKeyAt(a, kx, ky);
+			}
+		}
+	}
+
 	if (fabsf(dirZ) > 1e-6f) {
 		float t = (screenZ - pose.position.z) / dirZ;
 		if (t > 0) {
@@ -1098,7 +1766,8 @@ static void processInput(VRApp *a) {
 			hover = uiButtonAt(a, hitX, hitY);
 
 			float hw = a->screenHW, hh = a->screenHH;
-			if (hover < 0 && hitX >= -hw && hitX <= hw && hitY >= -hh && hitY <= hh) {
+			if (hover < 0 && !a->kbHitValid &&
+			    hitX >= -hw && hitX <= hw && hitY >= -hh && hitY <= hh) {
 				// Direct mapping from the plane hit to game pixels, matching
 				// the screen quad's UV layout (v=0 is at the world top edge).
 				// Used to compensate a mirrored controller ray; see dirX fix.
@@ -1160,11 +1829,19 @@ static void processInput(VRApp *a) {
 		if (sys && a->mouseValid) {
 			const float THRESH = 0.5f;
 
-			// Trigger → left click (absorbed when a floating button is hovered)
+			// Trigger → left click (absorbed when a floating button or a
+			// keyboard key is hovered; typing must never reach the game.
+			// A miss INSIDE the keyboard panel is absorbed too - a click
+			// meant for the panel must never land on the game under it.)
 			if (a->prevTriggerValues[1] < THRESH && a->triggerValues[1] >= THRESH) {
 				if (a->uiHover >= 0) {
 					fireUIButton(a, sys, a->uiHover);
 					a->uiClickAbsorbed = true;
+				} else if (a->kbHover >= 0) {
+					pressKbKey(a, a->kbHover);
+					a->uiClickAbsorbed = true;
+				} else if (a->kbHitValid) {
+					a->uiClickAbsorbed = true; // panel gap: swallow it
 				} else {
 					Common::Event ev;
 					ev.type = Common::EVENT_LBUTTONDOWN;
