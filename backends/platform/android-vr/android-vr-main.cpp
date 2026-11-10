@@ -36,6 +36,7 @@
 #include <cstdio>
 #include <string>
 #include <cstring>
+#include <vector>
 #include <cmath>
 #include <pthread.h>
 #include <unistd.h>
@@ -53,6 +54,7 @@
 #include "backends/platform/android/android.h"
 #include "backends/platform/android-vr/coop-selftest.h"
 #include "backends/platform/android-vr/coop-video-display.h"
+#include "backends/platform/android-vr/coop-cursor.h"
 
 #define LOG_TAG "ScummVM_VR_Main"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -908,6 +910,69 @@ static void drawUIButtons(VRApp *a, const float *viewProj) {
 	glUseProgram(0);
 }
 
+// Remote peers' pointers, received as 'C' frames and drawn over the
+// video this headset shows (M2). Same texture and recipe as the local
+// dot above; only the position source differs: normalised coordinates
+// from the wire, mapped through THIS headset's screen half-extents -
+// which is why the same circle lands right on another device's quad at
+// any screen scale. Drawn after drawUIButtons so it sits over
+// everything on the quad; peers whose samples went stale are gone by
+// the mailbox's own expiry.
+static void drawCoopCursors(VRApp *a, const float *viewProj) {
+	if (!Coop::g_coopCursorDisplayWant || !a->uiCursorTex)
+		return;
+
+	static std::vector<Coop::PeerCursor> cursors; // VR thread only
+	Coop::snapshotPeerCursors(&cursors);
+	bool anyVisible = false;
+	for (const Coop::PeerCursor &c : cursors)
+		if (c.visible)
+			anyVisible = true;
+	if (!anyVisible)
+		return;
+
+	glUseProgram(a->uiProgram);
+	glUniformMatrix4fv(a->uiMVPLoc, 1, GL_FALSE, viewProj);
+	glUniform1i(a->uiTexLoc, 0);
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	glDepthFunc(GL_LEQUAL);
+	glEnableVertexAttribArray(0);
+	glEnableVertexAttribArray(1);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, a->uiCursorTex);
+	float ctint[4] = {1, 1, 1, 1};
+	glUniform4fv(a->uiTintLoc, 1, ctint);
+
+	for (const Coop::PeerCursor &c : cursors) {
+		if (!c.visible)
+			continue;
+		// Inverse of processInput's normalisation, with this device's
+		// geometry; z = -2.5 is the shared screen plane.
+		const float x = (c.x / 10000.0f - 0.5f) * 2 * a->screenHW;
+		const float y = (0.5f - c.y / 10000.0f) * 2 * a->screenHH;
+		const float cs = 0.045f; // same dot size as the local pointer
+		float cverts[4][5] = {
+			{ x - cs, y - cs, -2.5f, 0, 0 },
+			{ x + cs, y - cs, -2.5f, 1, 0 },
+			{ x - cs, y + cs, -2.5f, 0, 1 },
+			{ x + cs, y + cs, -2.5f, 1, 1 },
+		};
+		glBindBuffer(GL_ARRAY_BUFFER, a->uiCursorVBO);
+		glBufferData(GL_ARRAY_BUFFER, sizeof(cverts), cverts, GL_DYNAMIC_DRAW);
+		glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 20, (void*)0);
+		glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 20, (void*)12);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		glBindBuffer(GL_ARRAY_BUFFER, 0);
+	}
+
+	glDisableVertexAttribArray(0);
+	glDisableVertexAttribArray(1);
+	glDepthFunc(GL_LESS);
+	glDisable(GL_BLEND);
+	glUseProgram(0);
+}
+
 // Which floating button (if any) the ray-plane hit point falls inside
 static int uiButtonAt(VRApp *a, float hitX, float hitY) {
 	for (int b = 0; b < kBtnCount; b++) {
@@ -1064,6 +1129,30 @@ static void processInput(VRApp *a) {
 	a->uiHover = hover;
 	// Keep the dot tidy: don't draw it when the ray grazes toward the horizon
 	a->rayHitValid = planeHit && fabsf(a->rayHitX) < 5.0f && fabsf(a->rayHitY) < 3.5f;
+
+	// The M2 'C' channel publishes this same intersection: it is the
+	// pointer, and getMousePosition() is never fed on this path. Positions
+	// are normalised to the screen rect = the captured backbuffer = the
+	// guest's quad, so they need no per-headset correction. A ray outside
+	// the rect publishes visible=false on purpose: the guest's overlay
+	// must disappear, not stick at the edge.
+	if (Coop::g_coopCursorSendWant) {
+		uint16 cx = 0, cy = 0;
+		bool insideRect = false;
+		if (planeHit) {
+			const float hw = a->screenHW, hh = a->screenHH;
+			float u = (a->rayHitX + hw) / (2 * hw);
+			float v = (hh - a->rayHitY) / (2 * hh);
+			insideRect = u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f;
+			if (u < 0.0f) u = 0.0f;
+			if (u > 1.0f) u = 1.0f;
+			if (v < 0.0f) v = 0.0f;
+			if (v > 1.0f) v = 1.0f;
+			cx = (uint16)(u * 10000.0f + 0.5f);
+			cy = (uint16)(v * 10000.0f + 0.5f);
+		}
+		Coop::publishCursorSample(cx, cy, insideRect);
+	}
 
 	// Right trigger → left click (edge detection at 0.5 threshold)
 	if (g_system && g_scummvmReady) {
@@ -1223,6 +1312,9 @@ static void renderFrame(VRApp *a) {
 
 			// Floating buttons above the screen edges
 			drawUIButtons(a, vpMat);
+
+			// Remote peers' pointers over the quad ('C' channel, M2)
+			drawCoopCursors(a, vpMat);
 
 			XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 			xrReleaseSwapchainImage(a->swapchains[v], &ri);

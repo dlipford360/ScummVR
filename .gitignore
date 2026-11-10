@@ -308,3 +308,4 @@ __pycache__/
 
 #Ignore vcpkg generated files
 /vcpkg_installed/
+android_project_vr/

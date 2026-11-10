@@ -47,6 +47,7 @@ VR_OBJS := \
 	platform/android-vr/coop-decode.o \
 	platform/android-vr/coop-capture.o \
 	platform/android-vr/coop-gameaudio.o \
+	platform/android-vr/coop-cursor.o \
 	platform/android-vr/android-vr-main.o \
 	platform/android-vr/android_native_app_glue.o
 VR_OBJS := $(addprefix $(VR_MODULE)/, $(VR_OBJS))

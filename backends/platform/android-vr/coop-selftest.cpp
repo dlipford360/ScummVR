@@ -41,6 +41,7 @@
 #include "backends/platform/android-vr/coop-encode.h"
 #include "backends/platform/android-vr/coop-decode.h"
 #include "backends/platform/android-vr/coop-gameaudio.h"
+#include "backends/platform/android-vr/coop-cursor.h"
 
 #ifdef __ANDROID__
 // The control plane is the Java HTTP stack, which needs a JNIEnv on the calling
@@ -101,6 +102,15 @@ struct Config {
 	// (host role), 2 = receive 'A' frames and play them through the mixer
 	// (guest role). Independent of videoMode: audio can be measured alone.
 	int audioMode;
+	// 0 = no cursor traffic, bit0 = send 'C' from the VR pointer ray,
+	// bit1 = accept 'C' frames and draw the overlay on the screen quad.
+	// Role-neutral on purpose: the relay routes host C to every guest and
+	// guest C to the host, and never echoes a peer its own frames, so
+	// both headsets can be senders and receivers at once. Like audio,
+	// independent of videoMode.
+	int cursorMode;
+	bool cursorDraw;
+	int cursorHz;
 };
 
 void trim(char *text) {
@@ -124,6 +134,8 @@ bool readConfig(const char *path, Config *out) {
 	out->asHost = true;
 	out->plaintext = false;
 	out->seconds = 20;
+	out->cursorDraw = true;
+	out->cursorHz = 30;
 
 	char line[256];
 	while (fgets(line, sizeof(line), file)) {
@@ -173,6 +185,21 @@ bool readConfig(const char *path, Config *out) {
 				out->audioMode = 1;
 			else if (!strcmp(value, "recv"))
 				out->audioMode = 2;
+		} else if (!strcmp(key, "cursor_draw")) {
+			out->cursorDraw = !strcmp(value, "true") || atoi(value) != 0;
+		} else if (!strcmp(key, "cursor_hz")) {
+			out->cursorHz = atoi(value);
+			if (out->cursorHz < 1 || out->cursorHz > 60)
+				out->cursorHz = 30;
+		} else if (!strcmp(key, "cursor")) {
+			if (!strcmp(value, "send"))
+				out->cursorMode = 1;
+			else if (!strcmp(value, "recv"))
+				out->cursorMode = 2;
+			else if (!strcmp(value, "both"))
+				out->cursorMode = 3;
+			else
+				warning("coop selftest: cursor value must be \"send\", \"recv\" or \"both\", got \"%s\"", value);
 		} else if (!strcmp(key, "seconds")) {
 			out->seconds = atoi(value);
 			if (out->seconds < 1)
@@ -1111,6 +1138,30 @@ void runTestBody(const Config &cfg) {
 		}
 	}
 
+	// cursor=send/recv/both: the M2 pointer channel, symmetric. The
+	// sender side is just a fixed-cadence grabber: the sample itself is
+	// published by this device's VR thread (its ray-plane hit IS the
+	// pointer), and this thread only ships the newest one ~30x a second,
+	// per the relay's cursor-channel guidance. Routing is the relay's:
+	// host C reaches every guest, guest C reaches the host, and nobody
+	// receives their own echo - so a headset showing both its own local
+	// dot and the peer's overlay is the intended picture. Loss of a C
+	// frame self-heals on the next tick - the payload is latest-state,
+	// no retransmit. The receiver needs no setup at all: the VR draw
+	// path turns its overlay on when the first 'C' arrives.
+	bool cursorOn = false;
+	int cursorSent = 0, cursorSendFails = 0, cursorNoSample = 0;
+	int64 cursorStartMs = 0, cursorNextMs = 0;
+	int cursorTicks = 0;
+	const int kCursorHz = cfg.cursorHz;
+	if (cfg.cursorMode & 1) {
+		cursorOn = true;
+		Coop::g_coopCursorSendWant = true;
+		cursorStartMs = nowMs();
+		cursorNextMs = cursorStartMs;
+		debug("coop selftest: cursor sender started - 'C' frames from the VR pointer ray at %d Hz", kCursorHz);
+	}
+
 	// Stay joined, send one application frame a second, and report everything the
 	// relay sends back. With two headsets this is where a sealed frame crossing a
 	// real relay in both directions gets proven.
@@ -1119,7 +1170,8 @@ void runTestBody(const Config &cfg) {
 	int clockStatusEvery = 0;
 	int mediaProbes = 0;
 	int64 nextSend = nowMs();
-	const int64 until = nowMs() + (int64)cfg.seconds * 1000;
+	const int64 runStartedMs = nowMs();
+	const int64 until = runStartedMs + (int64)cfg.seconds * 1000;
 	while (nowMs() < until && !transport.isClosed()) {
 		Transport::Event event;
 		while (transport.pollEvent(&event)) {
@@ -1136,6 +1188,13 @@ void runTestBody(const Config &cfg) {
 				} else if (video.sendRoom && handleRetransmitRequest(&video, event)) {
 					// A retransmit the host answered (counted, not logged:
 					// an RNR burst is a dozen datagrams a second at worst).
+				} else if (event.header.type == 'C') {
+					// The M2 pointer stream: store latest-per-peer; the VR
+					// draw thread snapshots it. The want-flag turns the
+					// overlay on at the first frame, so a room whose host
+					// sends no 'C' costs the guest nothing.
+					Coop::receivePeerCursor(event.header.peerId, event.payload, event.payloadLen);
+					Coop::g_coopCursorDisplayWant = cfg.cursorDraw;
 				} else {
 					debug("coop selftest: frame '%c' from peer %u, %d bytes, envelope 0x%02x",
 						event.header.type, event.header.peerId, event.payloadLen, event.envelope);
@@ -1204,6 +1263,26 @@ void runTestBody(const Config &cfg) {
 		// ahead of the game; it just has to be called often enough.
 		if (audio.active)
 			audio.audio.pump();
+
+		// Pointer: a 30 Hz grab-and-send, drift-free from the run start
+		// like the video cadence (the re-feed pacing lesson, §14). If the
+		// VR loop has not published a sample yet there is nothing to send;
+		// the counter says so rather than inventing a position.
+		if (cursorOn && nowMs() >= cursorNextMs) {
+			uint16 cx, cy;
+			bool vis;
+			if (Coop::grabCursorSample(&cx, &cy, &vis)) {
+				byte payload[5];
+				Coop::encodeCursorPayload(payload, sizeof(payload), cx, cy, vis);
+				if (transport.sendFrame('C', payload, sizeof(payload)))
+					++cursorSent;
+				else
+					++cursorSendFails;
+			} else {
+				++cursorNoSample;
+			}
+			cursorNextMs = cursorStartMs + (int64)(++cursorTicks) * 1000 / kCursorHz;
+		}
 
 		if (videoOn && nowMs() >= videoNextMs) {
 			// Real pacing: the frame timer, not the loop tick. Drift is
@@ -1302,6 +1381,7 @@ void runTestBody(const Config &cfg) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(10));
 	}
 
+	const int64 runElapsedMs = nowMs() - runStartedMs;
 	char status[Wire::kMaxHeaderBytes];
 	transport.statusText(status, sizeof(status));
 
@@ -1324,6 +1404,21 @@ void runTestBody(const Config &cfg) {
 				video.captured + video.refed, video.captured, video.refed, video.missedCapture);
 		}
 	}
+	if (cursorOn) {
+		// Stop the VR thread publishing first, then count both ends of the
+		// sender: what the room shipped and what it had nothing to ship for.
+		Coop::g_coopCursorSendWant = false;
+		debug("coop selftest: cursor sender: %d 'C' frames sent (%d send refusals), "
+				"%d ticks had no published sample yet",
+			cursorSent, cursorSendFails, cursorNoSample);
+	}
+	if ((cfg.cursorMode & 2) || Coop::g_coopCursorDisplayWant) {
+		const Coop::CursorStats cs = Coop::cursorStats();
+		debug("coop selftest: cursor receiver: %d 'C' payloads stored (%d malformed), "
+				"%d peer entries expired",
+			cs.received, cs.badPayload, cs.expired);
+		Coop::g_coopCursorDisplayWant = false;
+	}
 	if (cfg.videoMode == 3 && decode.dec.isOpen()) {
 		// Whatever the room still owes us first - a final AU can sit in the
 		// socket buffer after the timer expires - then whatever the decoder
@@ -1334,6 +1429,8 @@ void runTestBody(const Config &cfg) {
 				feedVideoFragment(&decode, event);
 			else if (event.kind == Wire::kRecvData && event.header.type == 'A' && audio.active)
 				feedAudioFragment(&audio, event);
+			else if (event.kind == Wire::kRecvData && event.header.type == 'C')
+				Coop::receivePeerCursor(event.header.peerId, event.payload, event.payloadLen);
 		}
 		decode.dec.drain(1000, decodeCb, &decode);
 		reportDecodeRun(&decode, cfg.seconds);
@@ -1388,9 +1485,10 @@ void runTestBody(const Config &cfg) {
 		}
 	}
 
-	debug("coop selftest: done after %d s - %u frames in (%u data, %u roster, %u control), "			"%d app frames and %d probe media frames sent, dropped events %u, bad packets %u, crypto drops %u, "
+	debug("coop selftest: done after %lld ms (configured %d s) - %u frames in (%u data, %u roster, %u control), "
+			"%d app frames and %d probe media frames sent, dropped events %u, bad packets %u, crypto drops %u, "
 			"HELLO written %u, datagrams in %u",
-		cfg.seconds, framesIn, dataIn, rosterIn, controlIn, appSeq, mediaProbes,
+		(long long)runElapsedMs, cfg.seconds, framesIn, dataIn, rosterIn, controlIn, appSeq, mediaProbes,
 		transport.droppedEvents(), transport.badPackets(), transport.cryptoDrops(),
 		transport.hellosSent(), transport.datagramsIn());
 	if (status[0])

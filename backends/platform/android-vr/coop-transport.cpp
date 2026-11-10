@@ -149,6 +149,9 @@ bool Transport::open(const char *host, int port) {
 		// can span ~135 datagrams. The OS may clamp these requests; report the
 		// effective sizes rather than assuming the requested capacity.
 		int opt = 4 << 20;
+		int reportDrops = 1;
+		if (setsockopt(fd, SOL_SOCKET, SO_RXQ_OVFL, &reportDrops, sizeof(reportDrops)) != 0)
+			debug("coop: socket overflow reporting unavailable: %s", strerror(errno));
 		setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &opt, sizeof(opt));
 		opt = 2 << 20;
 		setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &opt, sizeof(opt));
@@ -790,6 +793,8 @@ void Transport::pushEvent(const Wire::Received &received, int envelope) {
 void Transport::receiveLoop() {
 	int64 lastHelloMs = 0;
 	int64 lastPingMs = 0;
+	uint32 socketDrops = 0;
+	int64 maxHandleUs = 0;
 
 	while (!_stopping) {
 		const int64 now = monotonicMs();
@@ -829,9 +834,8 @@ void Transport::receiveLoop() {
 		}
 
 		if (_ready && !_closed && now - _lastPongMs > kLivenessMs) {
-			// The relay drops a binding after 30 s of silence; if we have not seen
-			// anything for twice our ping interval, treat the room as gone rather
-			// than encoding into the void.
+			// Require a relay acknowledgement within the liveness window.
+			// Keep this distinct from merely receiving forwarded media.
 			_closed = true;
 			noteStatus("liveness lost");
 			debug("coop: no answer from the relay for %d ms", kLivenessMs);
@@ -845,12 +849,28 @@ void Transport::receiveLoop() {
 			break;
 		if (ready > 0 && (pfd.revents & POLLIN)) {
 			byte packet[Wire::kMaxDatagramBytes];
-			const int received = (int)recv(_fd, packet, sizeof(packet), 0);
+			struct iovec iov = {packet, sizeof(packet)};
+			alignas(struct cmsghdr) byte ancillary[CMSG_SPACE(sizeof(uint32))];
+			struct msghdr msg = {};
+			msg.msg_iov = &iov;
+			msg.msg_iovlen = 1;
+			msg.msg_control = ancillary;
+			msg.msg_controllen = sizeof(ancillary);
+			const int received = (int)recvmsg(_fd, &msg, 0);
+			for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); received > 0 && c; c = CMSG_NXTHDR(&msg, c)) {
+				if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SO_RXQ_OVFL &&
+						c->cmsg_len >= CMSG_LEN(sizeof(socketDrops)))
+					memcpy(&socketDrops, CMSG_DATA(c), sizeof(socketDrops));
+			}
 			if (received > 0) {
 				// Counted before parsing: "nothing arrived" and "something arrived that
 				// we could not read" are different failures.
 				++_datagramsIn;
+				const int64 handleStart = monotonicUs();
 				handleDatagram(packet, received);
+				const int64 handleUs = monotonicUs() - handleStart;
+				if (handleUs > maxHandleUs)
+					maxHandleUs = handleUs;
 			}
 		} else if (ready > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
 			_closed = true;
@@ -858,6 +878,8 @@ void Transport::receiveLoop() {
 			break;
 		}
 	}
+	debug("coop: receive diagnostics: socket drops %u, max handler %lld us",
+		(unsigned)socketDrops, (long long)maxHandleUs);
 }
 
 } // namespace Coop
